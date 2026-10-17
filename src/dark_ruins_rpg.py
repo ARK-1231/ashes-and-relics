@@ -61,8 +61,8 @@ BOSS_PROJECTILE_STYLES = ("fan", "ring", "lance", "spiral", "wave")
 BOSS_PROJECTILE_DIRECTIONS = 16
 PLAYER_ATTACK_RADIUS = 110
 ALLY_SHIELD_AMOUNT = 20
-ALLY_SHIELD_PER_EXTRA_ALLY = 15
-ALLY_SHIELD_COOLDOWN = 8.0
+ALLY_SHIELD_PER_EXTRA_ALLY = 5
+ALLY_SHIELD_COOLDOWN = 12.0
 PLAYER_ATTACK_HALF_ANGLE = math.pi / 3
 
 
@@ -160,9 +160,16 @@ class DarkRuins2D:
         """Load small transparent landmarks once; retain shape fallbacks."""
         root = Path(__file__).resolve().parent.parent / "assets" / "sprites" / "landmarks"
         sprites = {}
+        self.landmark_ground_offsets = {}
         for name in ("shrine", "stairs", "exit"):
             try:
-                sprites[name] = tk.PhotoImage(master=self.root, file=str(root / f"{name}.png"))
+                sprite = tk.PhotoImage(master=self.root, file=str(root / f"{name}.png"))
+                sprites[name] = sprite
+                # Align the visible base, rather than assuming equal PNG padding.
+                bottom = next((y + 1 for y in range(sprite.height() - 1, -1, -1)
+                               if any(not sprite.transparency_get(x, y)
+                                      for x in range(sprite.width()))), sprite.height() - 8)
+                self.landmark_ground_offsets[name] = sprite.height() - bottom
             except (tk.TclError, OSError) as exc:
                 print(f"Could not load landmark {name}: {exc}", file=sys.stderr)
         return sprites
@@ -236,7 +243,7 @@ class DarkRuins2D:
     def _player_sprite(self) -> tk.PhotoImage | None:
         if not self.player_sprites:
             return None
-        fx, fy = self.facing
+        fx, fy = self.attack_direction if self.attack_flash > 0 else self.facing
         if abs(fx) > abs(fy):
             direction = "right" if fx >= 0 else "left"
         else:
@@ -304,7 +311,7 @@ class DarkRuins2D:
         poses = frames[f"{state}_{companion.facing}"]
         return poses[int(companion.walk_time * 7) % len(poses)]
 
-    def _draw_ally(self, name: str, x: float, y: float, companion: Companion | None = None) -> None:
+    def _draw_ally(self, name: str, x: float, y: float, companion: Companion | None = None) -> int | None:
         color, label = ALLY_STYLES.get(name, ("#e7b94c", name))
         sprite = self._ally_sprite(name, companion)
         self.canvas.create_polygon(
@@ -313,10 +320,12 @@ class DarkRuins2D:
         )
         if sprite is None:
             self._draw_actor(x, y, 18, color, "")
+            item = None
         else:
-            self.canvas.create_image(x, y + 12, image=sprite, anchor="s")
+            item = self.canvas.create_image(x, y + 12, image=sprite, anchor="s")
         display_label = label if companion is not None else f"加入前 · {label}"
         self._draw_role_label(x, y - 91, display_label, "#f2ca70")
+        return item
 
     def _draw_role_label(self, x: float, y: float, text: str, color: str) -> None:
         """Draw a readable role badge without creating image assets."""
@@ -500,6 +509,7 @@ class DarkRuins2D:
         self.keys: set[str] = set()
         self.px, self.py = stage(960), stage(1840)
         self.facing = (0.0, -1.0)
+        self.attack_direction = self.facing
         self.dodge_direction = self.facing
         self.hp = self.max_hp = 100
         self.player_shield = 0
@@ -917,11 +927,21 @@ class DarkRuins2D:
             return
         if self.ui_mode != "playing":
             return
+        self._set_cursor_aim(event.x, event.y)
+
+    def _aim_at_cursor(self) -> None:
+        """Refresh aim even when the cursor stayed still while the player moved."""
+        x, y = self.canvas.winfo_pointerxy()
+        self._set_cursor_aim(
+            x - self.canvas.winfo_rootx(), y - self.canvas.winfo_rooty(),
+        )
+
+    def _set_cursor_aim(self, x: float, y: float) -> None:
         width, height = self.canvas.winfo_width(), self.canvas.winfo_height()
         cam_x = min(max(self.px - width / 2, 0), WORLD_SIZE - width)
         cam_y = min(max(self.py - height / 2, 0), WORLD_SIZE - height)
-        mouse_world_x = event.x + cam_x
-        mouse_world_y = event.y + cam_y
+        mouse_world_x = x + cam_x
+        mouse_world_y = y + cam_y
         dx = mouse_world_x - self.px
         dy = mouse_world_y - self.py
         length = math.hypot(dx, dy)
@@ -1232,7 +1252,7 @@ class DarkRuins2D:
                 self._move_ally_toward(companion, *companion.path[0], dt)
 
     def _player_shield_capacity(self) -> int:
-        """Start at 20 shield points and add 15 per additional ally."""
+        """Start at 20 shield points and add 5 per additional ally."""
         if not self.allies:
             return 0
         return ALLY_SHIELD_AMOUNT + ALLY_SHIELD_PER_EXTRA_ALLY * (len(self.allies) - 1)
@@ -1254,7 +1274,6 @@ class DarkRuins2D:
             and not self._line_blocked(companion.x, companion.y, self.px, self.py, 4)
         ):
             self.player_shield = self._player_shield_capacity()
-            self.ally_shield_cd = ALLY_SHIELD_COOLDOWN
             companion.cooldown = companion.cooldown_max = 1.0
             companion.pose, companion.pose_time = "heal", 0.45
             self._spawn_visual_effect(
@@ -1515,6 +1534,8 @@ class DarkRuins2D:
         damage = max(2, base_damage - guard)
         absorbed = min(self.player_shield, damage)
         self.player_shield -= absorbed
+        if absorbed > 0 and self.player_shield == 0:
+            self.ally_shield_cd = ALLY_SHIELD_COOLDOWN
         hp_damage = damage - absorbed
         self.hp = max(0, self.hp - hp_damage)
         self.hurt_invincible = invincibility_duration
@@ -1578,13 +1599,37 @@ class DarkRuins2D:
 
     def _separate_enemies(self) -> None:
         """Push overlapping enemies apart without moving them through walls."""
+        if len(self.enemies) < 2:
+            return
+        cell_size = max(enemy.radius for enemy in self.enemies) * 2 + 6
+        cells = {}
+
+        def cell(enemy):
+            return math.floor(enemy.x / cell_size), math.floor(enemy.y / cell_size)
+
+        for index, enemy in enumerate(self.enemies):
+            cells.setdefault(cell(enemy), set()).add(index)
+
+        def nearby(first, after):
+            cx, cy = cell(first)
+            return {index
+                    for x in range(cx - 1, cx + 2)
+                    for y in range(cy - 1, cy + 2)
+                    for index in cells.get((x, y), ())
+                    if index > after}
+
         for index, first in enumerate(self.enemies):
-            for second in self.enemies[index + 1:]:
+            first_cell = cell(first)
+            pending = sorted(nearby(first, index), reverse=True)
+            while pending:
+                second_index = pending.pop()
+                second = self.enemies[second_index]
                 dx, dy = second.x - first.x, second.y - first.y
-                distance = math.hypot(dx, dy)
                 minimum = first.radius + second.radius + 6
-                if distance >= minimum:
+                # Most pairs are far apart; avoid a square root for each pair.
+                if dx * dx + dy * dy >= minimum * minimum:
                     continue
+                distance = math.hypot(dx, dy)
                 if distance < 0.001:
                     angle = self.rng.random() * math.tau
                     ux, uy = math.cos(angle), math.sin(angle)
@@ -1596,11 +1641,25 @@ class DarkRuins2D:
                 second_x, second_y = second.x + ux * push, second.y + uy * push
                 if not self._blocked(first_x, first_y, first.radius):
                     first.x, first.y = first_x, first_y
+                    # A push can bring another pair into range in this pass.
+                    # Keep the original list order, including those new pairs.
+                    pending = sorted(set(pending) | nearby(first, second_index), reverse=True)
                 if not self._blocked(second_x, second_y, second.radius):
+                    old_cell = cell(second)
                     second.x, second.y = second_x, second_y
+                    new_cell = cell(second)
+                    if old_cell != new_cell:
+                        cells[old_cell].remove(second_index)
+                        cells.setdefault(new_cell, set()).add(second_index)
+            new_cell = cell(first)
+            if first_cell != new_cell:
+                cells[first_cell].remove(index)
+                cells.setdefault(new_cell, set()).add(index)
 
     def _update_projectiles(self, dt: float) -> None:
-        for projectile in self.projectiles[:]:
+        # Compact once instead of searching/shifting the list for every removal.
+        survivors = []
+        for projectile in self.projectiles:
             projectile.life -= dt
             old_x, old_y = projectile.x, projectile.y
             if projectile.turn_rate:
@@ -1624,10 +1683,8 @@ class DarkRuins2D:
                     old_x, old_y, projectile.x, projectile.y, projectile.radius,
                 )
             ):
-                self.projectiles.remove(projectile)
                 continue
             if self._distance(self.px, self.py, projectile.x, projectile.y) < PLAYER_RADIUS + projectile.radius:
-                self.projectiles.remove(projectile)
                 self._damage_player(
                     projectile.damage,
                     "闇の弾を受けた！",
@@ -1638,6 +1695,9 @@ class DarkRuins2D:
                         else 0.55
                     ),
                 )
+            else:
+                survivors.append(projectile)
+        self.projectiles[:] = survivors
 
     def _knockback_player(self, source_x: float, source_y: float, strength: float) -> None:
         dx, dy = self.px - source_x, self.py - source_y
@@ -1729,6 +1789,8 @@ class DarkRuins2D:
             return
         if self.attack_cd:
             return
+        self._aim_at_cursor()
+        self.attack_direction = self.facing
         self.attack_cd = PLAYER_ATTACK_COOLDOWN
         self.attack_flash = PLAYER_ATTACK_ANIMATION_DURATION
         candidates = [enemy for enemy in self.enemies if self._in_attack_sector(enemy)
@@ -1745,7 +1807,7 @@ class DarkRuins2D:
         """Test the enemy circle against the entire filled attack sector."""
         dx, dy = enemy.x - self.px, enemy.y - self.py
         distance = math.hypot(dx, dy)
-        angle = math.atan2(dy, dx) - math.atan2(self.facing[1], self.facing[0])
+        angle = math.atan2(dy, dx) - math.atan2(self.attack_direction[1], self.attack_direction[0])
         angle = abs((angle + math.pi) % math.tau - math.pi)
         if angle <= PLAYER_ATTACK_HALF_ANGLE:
             return distance <= PLAYER_ATTACK_RADIUS + enemy.radius
@@ -1921,12 +1983,18 @@ class DarkRuins2D:
                     fill="", outline="#929aaa", width=2,
                 )
 
-        self._draw_landmark("shrine", sx(stage(960)), sy(stage(1660)), 34, "#4b80ad", "祠")
+        actor_sprites = []
+        landmark_sprites = []
+        landmark_x, landmark_y = sx(stage(960)), sy(stage(1660))
+        item = self._draw_landmark("shrine", landmark_x, landmark_y, 34, "#4b80ad", "祠")
+        landmark_sprites.append((landmark_x, landmark_y, item))
         exit_label = "階段" if self.dungeon_number in (1, 2) else "出口"
-        self._draw_landmark(
+        item = self._draw_landmark(
             "stairs" if self.dungeon_number in (1, 2) else "exit",
             sx(stage(960)), sy(stage(230)), 38, "#208c70", exit_label,
         )
+        if self.dungeon_number >= 3:
+            landmark_sprites.append((sx(stage(960)), sy(stage(230)), item))
         self._draw_marker(sx(stage(1110)), sy(stage(560)), 23, "#ad8b41" if self.inscription_found else "#292932", "碑文")
         if not self.door_open or self.boss_gate_locked:
             self.canvas.create_rectangle(sx(stage(760)), sy(stage(615)), sx(stage(1160)), sy(stage(685)), fill="#8f35ad", outline="#e3aaef", width=3)
@@ -1936,6 +2004,9 @@ class DarkRuins2D:
         for projectile in self.projectiles:
             x, y = sx(projectile.x), sy(projectile.y)
             radius = projectile.radius
+            # Include the longest fallback shape and the 48px projectile sprites.
+            if not self._rect_in_view(x, y, 0, 0, width, height, max(24, radius * 2.2) + 3):
+                continue
             projectile_sprite = self._boss_projectile_sprite(projectile)
             if projectile_sprite is not None:
                 self.canvas.create_image(x, y, image=projectile_sprite)
@@ -1960,6 +2031,8 @@ class DarkRuins2D:
 
         for bolt in self.ally_bolts:
             x, y = sx(bolt.x), sy(bolt.y)
+            if not self._rect_in_view(x, y, 0, 0, width, height, 14):
+                continue
             self.canvas.create_oval(
                 x - 7, y - 7, x + 7, y + 7,
                 fill="#70dfff", outline="#e0fbff", width=2,
@@ -1978,9 +2051,10 @@ class DarkRuins2D:
             color, _ = ALLY_STYLES.get(
                 self.ally_candidate_name, ("#e7b94c", self.ally_candidate_name),
             )
-            self._draw_ally(
+            item = self._draw_ally(
                 self.ally_candidate_name, sx(self.ally_candidate_x), sy(self.ally_candidate_y),
             )
+            actor_sprites.append((sx(self.ally_candidate_x), sy(self.ally_candidate_y), item))
         for enemy in self.enemies:
             # Keep windup indicators: their aim lines can cross the viewport
             # even when the attacking enemy is outside it.
@@ -1993,10 +2067,11 @@ class DarkRuins2D:
             enemy_color = "#ffd36a" if warning_on else enemy.color
             enemy_sprite = self._boss_sprite_for_attack(enemy) if enemy.boss else self._enemy_sprite(enemy)
             if enemy_sprite is not None:
-                self.canvas.create_image(
+                item = self.canvas.create_image(
                     sx(enemy.x), sy(enemy.y) + (enemy.radius if enemy.boss else self._enemy_sprite_offset()),
                     image=enemy_sprite, anchor="s",
                 )
+                actor_sprites.append((sx(enemy.x), sy(enemy.y), item))
             else:
                 self._draw_actor(sx(enemy.x), sy(enemy.y), enemy.radius, enemy_color, enemy.name)
             if enemy.windup > 0:
@@ -2070,7 +2145,8 @@ class DarkRuins2D:
             for ally_name in sorted(self.companions):
                 companion = self.companions[ally_name]
                 color, label = ALLY_STYLES.get(ally_name, ("#e7b94c", ally_name))
-                self._draw_ally(ally_name, sx(companion.x), sy(companion.y), companion)
+                item = self._draw_ally(ally_name, sx(companion.x), sy(companion.y), companion)
+                actor_sprites.append((sx(companion.x), sy(companion.y), item))
                 cooldown_ratio = (
                     companion.cooldown / companion.cooldown_max
                     if companion.cooldown_max > 0 else 0.0
@@ -2105,13 +2181,15 @@ class DarkRuins2D:
         if player_visible:
             player_sprite = self._player_sprite()
             if player_sprite is not None:
-                self.canvas.create_image(
+                item = self.canvas.create_image(
                     sx(self.px), sy(self.py) + self._player_sprite_offset(),
                     image=player_sprite, anchor="s",
                 )
+                actor_sprites.append((player_x, player_y, item))
             else:
                 self._draw_actor(sx(self.px), sy(self.py), PLAYER_RADIUS, player_color, "")
-        fx, fy = self.facing
+        self._order_landmark_overlaps(landmark_sprites, actor_sprites)
+        fx, fy = self.attack_direction if self.attack_flash > 0 else self.facing
         if not self.player_sprites:
             self.canvas.create_line(sx(self.px), sy(self.py), sx(self.px + fx * 42), sy(self.py + fy * 42), fill="#e8edf4", width=5)
         if self.attack_flash:
@@ -2176,7 +2254,7 @@ class DarkRuins2D:
             "【基本操作】\n"
             "移動　　　　WASD / 矢印キー\n"
             "向き　　　　マウスを動かした方向へ向く\n"
-            "攻撃　　　　左クリック / F / Enter（向いている敵を攻撃）\n"
+            "攻撃　　　　左クリック / F / Enter（カーソル方向へ攻撃）\n"
             "回避　　　　Space（カーソル方向へ回避し、短時間無敵）\n"
             "調べる　　　E（祠や隠された碑文の近くで使用）\n"
             "遺物切替　　1：灰刃　2：灯火　3：黒心\n"
@@ -2246,16 +2324,46 @@ class DarkRuins2D:
         if label:
             self.canvas.create_text(x, y + radius + 13, text=label, fill="#ddd9ce", font=("Yu Gothic UI", 9))
 
-    def _draw_landmark(self, key: str, x: float, y: float, radius: float, color: str, label: str) -> None:
+    def _draw_landmark(self, key: str, x: float, y: float, radius: float, color: str, label: str) -> int | None:
         sprite = self.landmark_sprites.get(key)
         if sprite is None:
             self._draw_marker(x, y, radius, color, label)
             return
-        # Source frames share a ground anchor at (64, 120).
-        self.canvas.create_image(x, y + 8, image=sprite, anchor="s")
+        offset = self.landmark_ground_offsets[key]
+        item = self.canvas.create_image(x, y + offset, image=sprite, anchor="s")
         self.canvas.create_text(
             x, y + 20, text=label, fill="#e7dfca", font=("Yu Gothic UI", 10, "bold"),
         )
+        return item
+
+    def _order_landmark_overlaps(self, landmarks, actors) -> None:
+        """Keep stairs on the floor; depth-sort sprites touching tall scenery."""
+        stack_order = None
+        for x, y, landmark in landmarks:
+            if landmark is None:
+                continue
+            bounds = self.canvas.bbox(landmark)
+            nearby = []
+            for ax, ay, actor in actors:
+                # Limit Tcl queries and stacking changes to the scenery's vicinity.
+                if actor is None or abs(ax - x) > 240 or abs(ay - y) > 300:
+                    continue
+                actor_bounds = self.canvas.bbox(actor)
+                if (bounds and actor_bounds
+                        and bounds[0] < actor_bounds[2] and actor_bounds[0] < bounds[2]
+                        and bounds[1] < actor_bounds[3] and actor_bounds[1] < bounds[3]):
+                    nearby.append((ay, actor))
+            if nearby:
+                ordered = sorted([(y, landmark)] + nearby, key=lambda pair: pair[0])
+                if stack_order is None:
+                    stack_order = {item: index for index, item in enumerate(self.canvas.find_all())}
+                # Reorder within the existing scene stack, below effects and HUD
+                # retained from the preceding frame by FrameCanvas.
+                previous = max((item for _, item in ordered), key=stack_order.__getitem__)
+                for _, item in ordered:
+                    if item != previous:
+                        self.canvas.tag_raise(item, previous)
+                    previous = item
 
     def _draw_marker(self, x: float, y: float, radius: float, color: str, label: str) -> None:
         self.canvas.create_polygon(x, y - radius, x + radius, y, x, y + radius, x - radius, y, fill=color, outline="#eee3bd", width=2)
@@ -2504,6 +2612,15 @@ def main() -> None:
 
             def winfo_height(self) -> int:
                 return HEIGHT
+
+            def width(self) -> int:
+                return 128
+
+            def height(self) -> int:
+                return 128
+
+            def transparency_get(self, *_args) -> bool:
+                return True
 
             def zoom(self, *_args):
                 return self

@@ -19,8 +19,11 @@ class InputResponseTests(unittest.TestCase):
         self.game.ally_shield_cd = 0.0
         self.game.attack_cd = self.game.attack_flash = 0.0
         self.game.enemies = []
+        self.game.facing = (0, -1)
+        self.game.attack_direction = self.game.facing
         self.game._play_sound = Mock()
         self.game._update_player_movement = Mock()
+        self.game._aim_at_cursor = Mock()
 
     def test_held_attack_does_not_wait_for_os_repeat(self):
         for key in ("f", "Return"):
@@ -72,6 +75,7 @@ class InputResponseTests(unittest.TestCase):
         game = self.game
         game.px = game.py = 0
         game.facing = (1, 0)
+        game.attack_direction = game.facing
         for x, y, radius, expected in [
             (0, 0, 10, True), (110, 0, 0, True),
             (119, 0, 10, True), (121, 0, 10, False),
@@ -81,6 +85,65 @@ class InputResponseTests(unittest.TestCase):
             with self.subTest(x=x, y=y):
                 self.assertEqual(game._in_attack_sector(
                     SimpleNamespace(x=x, y=y, radius=radius)), expected)
+
+    def cursor_game(self):
+        game = self.game
+        game.px = game.py = 1000
+        self.cursor = [900, 360]
+        game.canvas = SimpleNamespace(
+            winfo_width=lambda: 1280, winfo_height=lambda: 720,
+            winfo_rootx=lambda: 100, winfo_rooty=lambda: 200,
+            winfo_pointerxy=lambda: (self.cursor[0] + 100, self.cursor[1] + 200),
+        )
+        game._aim_at_cursor = DarkRuins2D._aim_at_cursor.__get__(game)
+        return game
+
+    def test_click_and_keyboard_attacks_follow_cursor_instead_of_movement(self):
+        for trigger in ("click", "f", "Return"):
+            with self.subTest(trigger=trigger):
+                self.setUp()
+                game = self.cursor_game()
+                game.facing = (-1, 0)
+                if trigger == "click":
+                    game._mouse_attack(SimpleNamespace(x=900, y=360))
+                else:
+                    game._key_down(SimpleNamespace(keysym=trigger))
+                self.assertEqual(game.attack_direction, (1, 0))
+
+    def test_held_attack_refreshes_cursor_at_each_swing(self):
+        game = self.cursor_game()
+        game.keys = {"f"}
+        game._update_player_input(0)
+        self.assertEqual(game.attack_direction, (1, 0))
+        self.cursor[0] = 400
+        game._update_player_input(PLAYER_ATTACK_COOLDOWN)
+        self.assertEqual(game.attack_direction, (-1, 0))
+
+    def test_cursor_motion_during_swing_does_not_change_hit_direction(self):
+        game = self.cursor_game()
+        game._attack()
+        game._aim_with_mouse(SimpleNamespace(x=400, y=360))
+        self.assertEqual(game.facing, (-1, 0))
+        self.assertEqual(game.attack_direction, (1, 0))
+        self.assertTrue(game._in_attack_sector(SimpleNamespace(x=1080, y=1000, radius=10)))
+        self.assertFalse(game._in_attack_sector(SimpleNamespace(x=920, y=1000, radius=10)))
+
+    def test_stationary_cursor_is_recomputed_after_player_moves_at_map_edge(self):
+        game = self.cursor_game()
+        game.px, game.py = 100, 100
+        self.cursor[:] = [200, 100]
+        game._attack()
+        self.assertEqual(game.attack_direction, (1, 0))
+        game.px = 300
+        game.attack_cd = 0
+        game._attack()
+        self.assertEqual(game.attack_direction, (-1, 0))
+
+    def test_cursor_at_player_keeps_finite_direction(self):
+        game = self.cursor_game()
+        self.cursor[:] = [640, 360]
+        game._attack()
+        self.assertEqual(game.attack_direction, (0, -1))
 
 
 if __name__ == "__main__":

@@ -14,28 +14,59 @@ class AllyShieldTests(unittest.TestCase):
         self.game.ally_shield_cd = 0.0
         self.game.enemies = []
         self.game._spawn_visual_effect = Mock()
+        self.game.attack_cd = self.game.attack_flash = 0
+        self.game.keys = set()
+        self.game._update_player_movement = Mock()
 
     def test_grant_is_shared_and_does_not_stack(self):
         game = self.game
         mira = Companion("ミラ", 0, 0)
         game._perform_companion_action(mira)
         self.assertEqual(game.player_shield, 20)
-        self.assertEqual(game.ally_shield_cd, 8)
+        self.assertEqual(game.ally_shield_cd, 0)
         game._perform_companion_action(Companion("灰騎士レオン", 0, 0))
         self.assertEqual(game.player_shield, 20)
-        game.player_shield = 0
+        game._damage_player(20, "break", invincibility_duration=0)
+        self.assertEqual(game.ally_shield_cd, 12)
+        game._update_player_input(8)
         game._perform_companion_action(Companion("星詠みノア", 0, 0))
         self.assertEqual(game.player_shield, 0)
-        game.ally_shield_cd = 0
+        self.assertEqual(game.ally_shield_cd, 4)
+        game._update_player_input(4)
         game._perform_companion_action(mira)
         self.assertEqual(game.player_shield, 20)
+        self.assertEqual(game.ally_shield_cd, 0)
+
+    def test_long_lived_shield_still_requires_twelve_seconds_after_break(self):
+        game = self.game
+        game._perform_companion_action(Companion("ミラ", 0, 0))
+        game._update_player_input(60)
+        game._damage_player(20, "break", invincibility_duration=0)
+        self.assertEqual(game.ally_shield_cd, 12)
+        game._update_player_input(11.9)
+        game._perform_companion_action(Companion("灰騎士レオン", 0, 0))
+        self.assertEqual(game.player_shield, 0)
+        game._update_player_input(0.11)
+        game._perform_companion_action(Companion("灰騎士レオン", 0, 0))
+        self.assertEqual(game.player_shield, 20)
+
+    def test_partial_damage_does_not_start_timer_and_hp_damage_does_not_restart_it(self):
+        game = self.game
+        game.player_shield = 20
+        game._damage_player(10, "partial", invincibility_duration=0)
+        self.assertEqual(game.ally_shield_cd, 0)
+        game._damage_player(15, "overflow", invincibility_duration=0)
+        self.assertEqual((game.player_shield, game.hp, game.ally_shield_cd), (0, 95, 12))
+        game._update_player_input(8)
+        game._damage_player(10, "HP only", invincibility_duration=0)
+        self.assertEqual(game.ally_shield_cd, 4)
 
     def test_capacity_and_granted_shield_scale_with_recruited_allies(self):
         game = self.game
         names = ("ミラ", "灰騎士レオン", "星詠みノア")
         game.allies.clear()
         self.assertEqual(game._player_shield_capacity(), 0)
-        for name, expected in zip(names, (20, 35, 50)):
+        for name, expected in zip(names, (20, 25, 30)):
             game.allies.add(name)
             game.player_shield = 0
             game.ally_shield_cd = 0

@@ -1,0 +1,323 @@
+{
+  "assumptions": "Inspect current boss/shield numbers through the actual combat methods.\n\nThese scripted scenarios assume every player attack hits, with no movement,\nmisses, hit-stop delay, or companion attack damage. They are not playtest results.\n",
+  "boss_hits": [
+    {
+      "tier": 1,
+      "skill": "dark",
+      "hp_per_phase": 240,
+      "shield_per_phase": 180,
+      "approx_total_durability": 720.0,
+      "player_hit": 48,
+      "phase_hits": [
+        7,
+        9
+      ],
+      "ideal_seconds": 9.75
+    },
+    {
+      "tier": 2,
+      "skill": "gauntlet",
+      "hp_per_phase": 420,
+      "shield_per_phase": 261,
+      "approx_total_durability": 1152.0,
+      "player_hit": 68,
+      "phase_hits": [
+        7,
+        11
+      ],
+      "ideal_seconds": 11.05
+    },
+    {
+      "tier": 3,
+      "skill": "ember",
+      "hp_per_phase": 600,
+      "shield_per_phase": 342,
+      "approx_total_durability": 1584.0,
+      "player_hit": 100,
+      "phase_hits": [
+        7,
+        10
+      ],
+      "ideal_seconds": 10.4
+    },
+    {
+      "tier": 1,
+      "skill": "lantern",
+      "hp_per_phase": 240,
+      "shield_per_phase": 180,
+      "approx_total_durability": 720.0,
+      "player_hit": 38,
+      "phase_hits": [
+        8,
+        12
+      ],
+      "ideal_seconds": 12.35
+    },
+    {
+      "tier": 2,
+      "skill": "wing",
+      "hp_per_phase": 420,
+      "shield_per_phase": 261,
+      "approx_total_durability": 1152.0,
+      "player_hit": 46,
+      "phase_hits": [
+        11,
+        15
+      ],
+      "ideal_seconds": 16.25
+    },
+    {
+      "tier": 3,
+      "skill": "ward",
+      "hp_per_phase": 600,
+      "shield_per_phase": 342,
+      "approx_total_durability": 1584.0,
+      "player_hit": 70,
+      "phase_hits": [
+        10,
+        14
+      ],
+      "ideal_seconds": 14.95
+    }
+  ],
+  "incoming_damage": [
+    {
+      "tier": 1,
+      "skill": "dark",
+      "capacity": 20,
+      "best_case_shield_per_second": 2.5,
+      "hp_damage_without_shield": {
+        "melee": 17,
+        "fan": 11,
+        "ring": 9,
+        "lance": 14,
+        "wave": 12,
+        "spiral": 8
+      }
+    },
+    {
+      "tier": 2,
+      "skill": "gauntlet",
+      "capacity": 35,
+      "best_case_shield_per_second": 4.375,
+      "hp_damage_without_shield": {
+        "melee": 18,
+        "fan": 12,
+        "ring": 10,
+        "lance": 15,
+        "wave": 13,
+        "spiral": 9
+      }
+    },
+    {
+      "tier": 3,
+      "skill": "ember",
+      "capacity": 50,
+      "best_case_shield_per_second": 6.25,
+      "hp_damage_without_shield": {
+        "melee": 19,
+        "fan": 13,
+        "ring": 11,
+        "lance": 16,
+        "wave": 14,
+        "spiral": 10
+      }
+    },
+    {
+      "tier": 1,
+      "skill": "lantern",
+      "capacity": 20,
+      "best_case_shield_per_second": 2.5,
+      "hp_damage_without_shield": {
+        "melee": 13,
+        "fan": 7,
+        "ring": 5,
+        "lance": 10,
+        "wave": 8,
+        "spiral": 4
+      }
+    },
+    {
+      "tier": 2,
+      "skill": "wing",
+      "capacity": 35,
+      "best_case_shield_per_second": 4.375,
+      "hp_damage_without_shield": {
+        "melee": 11,
+        "fan": 5,
+        "ring": 3,
+        "lance": 8,
+        "wave": 6,
+        "spiral": 2
+      }
+    },
+    {
+      "tier": 3,
+      "skill": "ward",
+      "capacity": 50,
+      "best_case_shield_per_second": 6.25,
+      "hp_damage_without_shield": {
+        "melee": 9,
+        "fan": 3,
+        "ring": 2,
+        "lance": 6,
+        "wave": 4,
+        "spiral": 2
+      }
+    }
+  ],
+  "standing_melee_sustain": [
+    {
+      "tier": 1,
+      "skill": "dark",
+      "shield_enabled": true,
+      "survived_seconds": 20.26,
+      "melee_hits": 16,
+      "shield_grants": 1,
+      "hp": 0,
+      "shield": 0
+    },
+    {
+      "tier": 1,
+      "skill": "dark",
+      "shield_enabled": false,
+      "survived_seconds": 17.56,
+      "melee_hits": 14,
+      "shield_grants": 0,
+      "hp": 0,
+      "shield": 0
+    },
+    {
+      "tier": 2,
+      "skill": "wing",
+      "shield_enabled": true,
+      "survived_seconds": 60.0,
+      "melee_hits": 45,
+      "shield_grants": 8,
+      "hp": 67,
+      "shield": 2
+    },
+    {
+      "tier": 2,
+      "skill": "wing",
+      "shield_enabled": false,
+      "survived_seconds": 21.61,
+      "melee_hits": 17,
+      "shield_grants": 0,
+      "hp": 0,
+      "shield": 0
+    },
+    {
+      "tier": 2,
+      "skill": "chalice",
+      "shield_enabled": true,
+      "survived_seconds": 60.0,
+      "melee_hits": 45,
+      "shield_grants": 8,
+      "hp": 97,
+      "shield": 0
+    },
+    {
+      "tier": 2,
+      "skill": "chalice",
+      "shield_enabled": false,
+      "survived_seconds": 41.86,
+      "melee_hits": 32,
+      "shield_grants": 0,
+      "hp": 0,
+      "shield": 0
+    },
+    {
+      "tier": 3,
+      "skill": "ward",
+      "shield_enabled": true,
+      "survived_seconds": 60.0,
+      "melee_hits": 45,
+      "shield_grants": 8,
+      "hp": 152,
+      "shield": 23
+    },
+    {
+      "tier": 3,
+      "skill": "ward",
+      "shield_enabled": false,
+      "survived_seconds": 44.56,
+      "melee_hits": 34,
+      "shield_grants": 0,
+      "hp": 0,
+      "shield": 0
+    },
+    {
+      "tier": 3,
+      "skill": "dew",
+      "shield_enabled": true,
+      "survived_seconds": 60.0,
+      "melee_hits": 45,
+      "shield_grants": 8,
+      "hp": 180,
+      "shield": 0
+    },
+    {
+      "tier": 3,
+      "skill": "dew",
+      "shield_enabled": false,
+      "survived_seconds": 60.0,
+      "melee_hits": 45,
+      "shield_grants": 0,
+      "hp": 117,
+      "shield": 0
+    }
+  ],
+  "proposal_20_25_30_cooldown12": [
+    {
+      "tier": 1,
+      "skill": "dark",
+      "shield_enabled": true,
+      "survived_seconds": 20.26,
+      "melee_hits": 16,
+      "shield_grants": 1,
+      "hp": 0,
+      "shield": 0
+    },
+    {
+      "tier": 2,
+      "skill": "wing",
+      "shield_enabled": true,
+      "survived_seconds": 43.21,
+      "melee_hits": 33,
+      "shield_grants": 4,
+      "hp": 0,
+      "shield": 0
+    },
+    {
+      "tier": 2,
+      "skill": "chalice",
+      "shield_enabled": true,
+      "survived_seconds": 60.0,
+      "melee_hits": 45,
+      "shield_grants": 5,
+      "hp": 63,
+      "shield": 0
+    },
+    {
+      "tier": 3,
+      "skill": "ward",
+      "shield_enabled": true,
+      "survived_seconds": 60.0,
+      "melee_hits": 45,
+      "shield_grants": 5,
+      "hp": 65,
+      "shield": 0
+    },
+    {
+      "tier": 3,
+      "skill": "dew",
+      "shield_enabled": true,
+      "survived_seconds": 60.0,
+      "melee_hits": 45,
+      "shield_grants": 5,
+      "hp": 154,
+      "shield": 0
+    }
+  ]
+}
