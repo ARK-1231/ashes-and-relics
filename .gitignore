@@ -1,0 +1,8 @@
+.python313/
+.venv*/
+.vscode/
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example
