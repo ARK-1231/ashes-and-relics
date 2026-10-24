@@ -7,6 +7,12 @@ deterministic frame extraction; each pose was normalized into a 96 x 96 transpar
 runtime frame. The full sheet now lives in
 `assets/sprites/archive/superseded_assets_2026-08-29.zip`.
 
+`ruined_knight_walk_sheet.png` is the complete 4 x 4 walking source produced
+from the authored v1 ruined-knight sheet with the built-in image generation
+tool. Rows are down, up, left, and right; columns are the four walk poses.
+Run `tools/install_ruined_knight_walk.ps1` from the project root to normalize
+the cells into the active 96 x 96 runtime frames.
+
 Final prompt:
 
 > Create a coherent four-frame sword attack animation for this exact ruined knight

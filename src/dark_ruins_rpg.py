@@ -65,6 +65,34 @@ ALLY_SHIELD_PER_EXTRA_ALLY = 5
 ALLY_SHIELD_COOLDOWN = 12.0
 PLAYER_ATTACK_HALF_ANGLE = math.pi / 3
 
+# One condition is rolled from the stage seed whenever a new ruin is created.
+# Keeping the data in one place makes both combat tuning and HUD copy agree.
+STAGE_EVENTS = {
+    "calm": ("静穏", "特別な変化はない", "#aab3c2"),
+    "fog": ("濃霧", "視界が大きく制限される", "#9fb8c8"),
+    "fortified": ("堅牢な群れ", "敵のHPが35%増加", "#e0a866"),
+    "ferocious": ("凶暴化", "敵の攻撃力が30%増加", "#ef6f65"),
+    "haste": ("影走り", "敵の移動速度が25%増加", "#c88cff"),
+    "swarm": ("群体発生", "通常敵が5体増加", "#d7c56b"),
+    "twin_boss": ("双王の影", "守護者が2体出現", "#ff83c6"),
+    "undying": ("不死者の契約", "通常敵が一度だけ復活", "#80d6a6"),
+    "blood_price": ("血の代償", "攻撃力+25%・攻撃時HP-2", "#ff596f"),
+    "boss_command": ("守護者の号令", "ボス戦中に敵を召喚", "#f0a35b"),
+}
+STAGE_EVENT_KEYS = tuple(STAGE_EVENTS)
+STAGE_EVENT_WEIGHTS = {
+    "calm": 18,
+    "fog": 20,
+    "fortified": 20,
+    "ferocious": 20,
+    "haste": 18,
+    "swarm": 15,
+    "twin_boss": 4,
+    "undying": 13,
+    "blood_price": 13,
+    "boss_command": 10,
+}
+
 
 class FrameCanvas(tk.Canvas):
     """Reuse canvas items in draw order instead of rebuilding them every frame."""
@@ -440,9 +468,12 @@ class DarkRuins2D:
                 for direction in ("up", "down", "left", "right"):
                     for animation in ("idle", "walk", "attack"):
                         key = f"{animation}_{direction}"
-                        loaded[enemy_name][key] = [
-                            tk.PhotoImage(file=str(root / enemy_id / direction / animation / f"{index:02}.png"))
+                        frame_paths = [
+                            root / enemy_id / direction / animation / f"{index:02}.png"
                             for index in range(1, 5)
+                        ]
+                        loaded[enemy_name][key] = [
+                            tk.PhotoImage(file=str(path)) for path in frame_paths
                         ]
             return loaded
         except (tk.TclError, OSError) as exc:
@@ -504,6 +535,7 @@ class DarkRuins2D:
                 "truth": self.truth,
                 "allies": set(self.allies),
                 "dungeon_number": getattr(self, "dungeon_number", 1) + 1,
+                "stage_events": tuple(getattr(self, "stage_events", (self.stage_event,))),
             }
         self.dungeon_number = progress["dungeon_number"] if progress else 1
         self.keys: set[str] = set()
@@ -528,7 +560,10 @@ class DarkRuins2D:
         self.screen_shake_strength = 0.0
         self.interact_cd = 0.0
         self.game_over = False
+        self.ending_message: str | None = None
         self.next_dungeon_timer = 0.0
+        self.pending_revives: list[tuple[Enemy, float]] = []
+        self.boss_summon_timer = 8.0
         self.has_ally = False
         self.allies: set[str] = set()
         ally_by_dungeon = {1: "ミラ", 2: "灰騎士レオン", 3: "星詠みノア"}
@@ -538,6 +573,13 @@ class DarkRuins2D:
         self.boss_gate_locked = False
         self.stage_seed = stage_seed if stage_seed is not None else random.randrange(1_000_000)
         self.rng = random.Random(self.stage_seed)
+        previous_events = list(progress["stage_events"]) if progress else []
+        previous_events.append(self._roll_stage_event(previous_events, self.rng))
+        self.stage_events = tuple(previous_events)
+        # Retain the latest event as a convenience for older tooling.
+        self.stage_event = self.stage_events[-1]
+        self.event_intro_key = self.stage_event
+        self.event_intro_until = time.perf_counter() + 4.0
 
         self.walls = self._make_walls()
         self.reachable_cells = self._reachable_cells(self.walls, door_open=False)
@@ -590,6 +632,21 @@ class DarkRuins2D:
         self.screen_flash_time = 0.0
         self.screen_flash_duration = 0.0
         self.last_time = time.perf_counter()
+
+    @staticmethod
+    def _roll_stage_event(previous_events: list[str], rng: random.Random) -> str:
+        """Choose a weighted, non-repeating event for the next floor."""
+        event_pool = [
+            event for event in STAGE_EVENT_KEYS
+            if event not in previous_events and (not previous_events or event != "calm")
+        ]
+        if not event_pool:
+            event_pool = list(STAGE_EVENT_KEYS)
+        return rng.choices(
+            event_pool,
+            weights=[STAGE_EVENT_WEIGHTS[event] for event in event_pool],
+            k=1,
+        )[0]
 
     def _make_walls(self) -> list[tuple[float, float, float, float]]:
         border = stage(35)
@@ -705,14 +762,21 @@ class DarkRuins2D:
 
     def _make_enemies(self) -> list[Enemy]:
         tier = self.dungeon_number - 1
-        hp_scale = 1.0 + tier * 0.45
-        damage_scale = 1.0 + tier * 0.25
-        speed_scale = 1.0 + tier * 0.07
+        stage_events = set(getattr(self, "stage_events", (getattr(self, "stage_event", "calm"),)))
+        event_hp, event_damage, event_speed = self._event_enemy_multipliers(stage_events)
+        hp_scale = (1.0 + tier * 0.45) * event_hp
+        damage_scale = (1.0 + tier * 0.25) * event_damage
+        speed_scale = (1.0 + tier * 0.07) * event_speed
         specs = (
             [("灰の兵士", 45, 10, 95, 23, "#9e3129")] * 8
             + [("廃騎士", 70, 16, 78, 29, "#6f2623")] * 4
             + [("さまよう影", 32, 14, 125, 20, "#63377d")] * 5
         )
+        if "swarm" in stage_events:
+            specs += (
+                [("灰の兵士", 45, 10, 95, 23, "#9e3129")] * 3
+                + [("さまよう影", 32, 14, 125, 20, "#63377d")] * 2
+            )
         occupied = [(self.px, self.py)] + [(r.x, r.y) for r in self.relics]
         enemies = []
         for name, hp, damage, speed, radius, color in specs:
@@ -731,15 +795,35 @@ class DarkRuins2D:
         boss_hp = 240 + tier * 180
         boss_damage = 22 + tier * 9
         boss_shield = round(180 * (1.0 + tier * 0.45))
-        enemies.append(Enemy(
-            "王国の守護者", stage(960), stage(430),
-            boss_hp,
-            boss_damage,
-            68 * speed_scale,
-            46, "#17151e", True,
-            max_hp=boss_hp, shield=boss_shield, max_shield=boss_shield,
-        ))
+        boss_hp = round(boss_hp * event_hp)
+        boss_shield = round(boss_shield * event_hp)
+        boss_damage = round(boss_damage * event_damage)
+        boss_positions = (
+            (stage(840), stage(430)),
+            (stage(1080), stage(430)),
+        ) if "twin_boss" in stage_events else ((stage(960), stage(430)),)
+        for boss_x, boss_y in boss_positions:
+            enemies.append(Enemy(
+                "王国の守護者", boss_x, boss_y,
+                boss_hp,
+                boss_damage,
+                68 * speed_scale,
+                46, "#17151e", True,
+                max_hp=boss_hp, shield=boss_shield, max_shield=boss_shield,
+            ))
         return enemies
+
+    @staticmethod
+    def _event_enemy_multipliers(events: set[str]) -> tuple[float, float, float]:
+        """Return event bonuses with safeguards for punishing combinations."""
+        hp = 1.25 if {"fortified", "ferocious"}.issubset(events) else 1.35
+        damage = 1.20 if {"fortified", "ferocious"}.issubset(events) else 1.30
+        speed = 1.15 if {"fog", "haste"}.issubset(events) else 1.25
+        return (
+            hp if "fortified" in events else 1.0,
+            damage if "ferocious" in events else 1.0,
+            speed if "haste" in events else 1.0,
+        )
 
     def _random_open_position(
         self,
@@ -1377,6 +1461,12 @@ class DarkRuins2D:
     # ------------------------------------------------------------------
 
     def _update_enemies(self, dt: float) -> None:
+        self._update_enemy_revives(dt)
+        if "boss_command" in self.stage_events and self.boss_gate_locked:
+            self.boss_summon_timer = max(0.0, self.boss_summon_timer - dt)
+            if self.boss_summon_timer == 0:
+                self._summon_boss_reinforcements()
+                self.boss_summon_timer = 12.0 if "twin_boss" in self.stage_events else 9.0
         for enemy in self.enemies:
             enemy.cooldown = max(0.0, enemy.cooldown - dt)
             enemy.attack_pose_time = max(0.0, enemy.attack_pose_time - dt)
@@ -1391,7 +1481,8 @@ class DarkRuins2D:
                 enemy.boss_phase = 2
                 enemy.hp = enemy.max_hp
                 enemy.shield = enemy.max_shield
-                enemy.speed = 88 * (1.0 + (self.dungeon_number - 1) * 0.07)
+                event_speed = self._event_enemy_multipliers(set(self.stage_events))[2]
+                enemy.speed = 88 * (1.0 + (self.dungeon_number - 1) * 0.07) * event_speed
                 enemy.cooldown = 0.7
                 self._spawn_visual_effect(
                     enemy.x, enemy.y, "#df65ff", 30, 135, "#b22cff", 0.22,
@@ -1450,6 +1541,66 @@ class DarkRuins2D:
             if distance <= enemy.radius + melee_reach and not enemy.cooldown:
                 self._start_enemy_attack(enemy, "melee", 0.38 if not enemy.boss else 0.55)
         self._separate_enemies()
+
+    def _update_enemy_revives(self, dt: float) -> None:
+        """Return contracted normal enemies once after a short delay."""
+        for index in range(len(self.pending_revives) - 1, -1, -1):
+            enemy, timer = self.pending_revives[index]
+            timer -= dt
+            if timer > 0:
+                self.pending_revives[index] = (enemy, timer)
+                continue
+            self.pending_revives.pop(index)
+            revive_ratio = 0.35 if "swarm" in self.stage_events else 0.5
+            enemy.hp = max(1, round(enemy.max_hp * revive_ratio))
+            enemy.cooldown = 0.8
+            enemy.windup = 0.0
+            enemy.pending_attack = ""
+            self.enemies.append(enemy)
+            self._spawn_visual_effect(
+                enemy.x, enemy.y, "#79e0a1", 16, 72, "#b9ffd1", 0.12,
+            )
+            self._say(f"{enemy.name}が不死者の契約で蘇った！", 1.5)
+
+    def _summon_boss_reinforcements(self) -> None:
+        """Summon one soldier per living boss, with an active-enemy cap."""
+        bosses = [enemy for enemy in self.enemies if enemy.boss]
+        summoned_count = sum(enemy.summoned for enemy in self.enemies)
+        twin_command = "twin_boss" in self.stage_events
+        summon_cap = 6 if twin_command else 10
+        if not bosses or summoned_count >= summon_cap:
+            return
+        tier = self.dungeon_number - 1
+        event_hp, event_damage, event_speed = self._event_enemy_multipliers(set(self.stage_events))
+        hp_scale = (1.0 + tier * 0.45) * event_hp
+        damage_scale = (1.0 + tier * 0.25) * event_damage
+        speed_scale = (1.0 + tier * 0.07) * event_speed
+        spawned = 0
+        # With two bosses, alternate the caller instead of doubling every wave.
+        summoners = [self.rng.choice(bosses)] if twin_command else bosses
+        for boss in summoners:
+            if summoned_count + spawned >= summon_cap:
+                break
+            for attempt in range(12):
+                angle = self.rng.random() * math.tau
+                distance = 105 + attempt * 5
+                x = boss.x + math.cos(angle) * distance
+                y = boss.y + math.sin(angle) * distance
+                if self._blocked(x, y, 23):
+                    continue
+                soldier = Enemy(
+                    "灰の兵士", x, y,
+                    round(45 * hp_scale), round(10 * damage_scale),
+                    95 * speed_scale, 23, "#9e3129", summoned=True,
+                )
+                self.enemies.append(soldier)
+                spawned += 1
+                self._spawn_visual_effect(
+                    x, y, "#f0a35b", 12, 58, "#ffd19a", 0.1,
+                )
+                break
+        if spawned:
+            self._say("守護者の号令で灰の兵士が召喚された！", 1.5)
 
     def _boss_attack_pool(self, enemy: Enemy) -> list[str]:
         """Retain earlier attacks and unlock one more in each second phase."""
@@ -1793,6 +1944,8 @@ class DarkRuins2D:
         self.attack_direction = self.facing
         self.attack_cd = PLAYER_ATTACK_COOLDOWN
         self.attack_flash = PLAYER_ATTACK_ANIMATION_DURATION
+        if "blood_price" in getattr(self, "stage_events", ()):
+            self.hp = max(1, self.hp - 2)
         candidates = [enemy for enemy in self.enemies if self._in_attack_sector(enemy)
                       and not self._line_blocked(self.px, self.py, enemy.x, enemy.y, 5)]
         if not candidates:
@@ -1829,6 +1982,8 @@ class DarkRuins2D:
         damage = self.attack + skill_damage
         if self.skill == "lantern" and ("影" in enemy.name or enemy.boss):
             damage += 8
+        if "blood_price" in getattr(self, "stage_events", ()):
+            damage = round(damage * 1.25)
         shield_damage, hp_damage = self._damage_enemy(enemy, damage)
         dx, dy = enemy.x - self.px, enemy.y - self.py
         hit_distance = max(1.0, math.hypot(dx, dy))
@@ -1867,8 +2022,15 @@ class DarkRuins2D:
                 flash_duration=0.28 if enemy.boss else 0.1,
             )
             self.enemies.remove(enemy)
+            if (
+                "undying" in self.stage_events
+                and not enemy.boss
+                and not enemy.revived_once
+            ):
+                enemy.revived_once = True
+                self.pending_revives.append((enemy, 3.0))
             self._say(f"{enemy.name}を倒した。")
-        if boss_defeated:
+        if boss_defeated and not any(enemy.boss for enemy in self.enemies):
             self.boss_gate_locked = False
             if self.dungeon_number >= 3:
                 self._complete_game()
@@ -1926,6 +2088,7 @@ class DarkRuins2D:
             ending = "断片エンド：自分が王国崩壊に関わった記憶を取り戻したが、全貌は闇に残った。"
         else:
             ending = "通常エンド：真実を知らぬまま、灰の王国を脱出した。"
+        self.ending_message = ending
         self._say("GAME CLEAR！ " + ending + "  " + self._end_options(), 999)
 
     # ------------------------------------------------------------------
@@ -2047,6 +2210,19 @@ class DarkRuins2D:
                 sx(relic.x), sy(relic.y), 0, 0, width, height, 100,
             ):
                 self._draw_relic(relic, sx(relic.x), sy(relic.y))
+        for enemy, revive_timer in self.pending_revives:
+            x, y = sx(enemy.x), sy(enemy.y)
+            if not self._rect_in_view(x, y, 0, 0, width, height, 80):
+                continue
+            pulse = 26 + (3.0 - min(3.0, revive_timer)) * 8
+            self.canvas.create_oval(
+                x - pulse, y - pulse, x + pulse, y + pulse,
+                outline="#79e0a1", width=3, dash=(4, 3),
+            )
+            self.canvas.create_text(
+                x, y, text=f"復活 {revive_timer:.1f}",
+                fill="#b9ffd1", font=("Yu Gothic UI", 9, "bold"),
+            )
         if self.ally_candidate_name:
             color, _ = ALLY_STYLES.get(
                 self.ally_candidate_name, ("#e7b94c", self.ally_candidate_name),
@@ -2074,6 +2250,23 @@ class DarkRuins2D:
                 actor_sprites.append((sx(enemy.x), sy(enemy.y), item))
             else:
                 self._draw_actor(sx(enemy.x), sy(enemy.y), enemy.radius, enemy_color, enemy.name)
+            if (
+                enemy.boss
+                and "boss_command" in self.stage_events
+                and self.boss_gate_locked
+                and self.boss_summon_timer <= 2.0
+            ):
+                summon_radius = enemy.radius + 42 + (2.0 - self.boss_summon_timer) * 18
+                self.canvas.create_oval(
+                    sx(enemy.x) - summon_radius, sy(enemy.y) - summon_radius,
+                    sx(enemy.x) + summon_radius, sy(enemy.y) + summon_radius,
+                    outline="#f0a35b", width=4, dash=(7, 4),
+                )
+                self.canvas.create_text(
+                    sx(enemy.x), sy(enemy.y) - enemy.radius - 55,
+                    text=f"召喚 {self.boss_summon_timer:.1f}",
+                    fill="#ffd19a", font=("Yu Gothic UI", 10, "bold"),
+                )
             if enemy.windup > 0:
                 progress = 1.0 - enemy.windup / max(0.001, enemy.windup_max)
                 warning_colors = {
@@ -2212,8 +2405,14 @@ class DarkRuins2D:
             player_x - 6, player_y - 84, player_x + 6, player_y - 84,
             player_x, player_y - 77, fill="#63e6ff", outline="#101722",
         )
+        if "fog" in self.stage_events:
+            self._draw_fog(width, height, player_x, player_y)
         self._draw_ui(width, height, sx(self.px), sy(self.py))
         self._draw_minimap(width, height)
+        if time.perf_counter() < self.event_intro_until:
+            self._draw_event_intro(width, height)
+        if self.ending_message is not None:
+            self._draw_completion_overlay(width, height)
         if self.ui_mode == "paused":
             self._draw_pause_menu(width, height)
 
@@ -2242,6 +2441,54 @@ class DarkRuins2D:
             width / 2, height - 38,
             text="↑↓ / W S：選択　 Enter / Space：決定",
             fill="#777f91", font=("Yu Gothic UI", 10),
+        )
+
+    def _draw_completion_overlay(self, width: int, height: int) -> None:
+        """Show a persistent, wrapped ending panel independent of notifications."""
+        panel_width = min(720, width - 80)
+        left, right = (width - panel_width) / 2, (width + panel_width) / 2
+        top, bottom = height / 2 - 145, height / 2 + 145
+        self.canvas.create_rectangle(
+            0, 0, width, height, fill="#05070b", outline="", stipple="gray50",
+        )
+        self.canvas.create_rectangle(
+            left, top, right, bottom,
+            fill="#0b0e15", outline="#d5b76f", width=3,
+        )
+        self.canvas.create_text(
+            width / 2, top + 48, text="GAME CLEAR",
+            fill="#ffe3a0", font=("Yu Gothic UI", 28, "bold"),
+        )
+        self.canvas.create_text(
+            width / 2, top + 125, text=self.ending_message,
+            width=panel_width - 90, justify="center",
+            fill="#e8e2d5", font=("Yu Gothic UI", 14, "bold"),
+        )
+        self.canvas.create_text(
+            width / 2, bottom - 42, text=self._end_options(),
+            fill="#9fc3e8", font=("Yu Gothic UI", 12, "bold"),
+        )
+
+    def _draw_event_intro(self, width: int, height: int) -> None:
+        """Announce the newly rolled condition without hiding the HUD for long."""
+        event_name, event_effect, event_color = STAGE_EVENTS[self.event_intro_key]
+        top, bottom = height / 2 - 72, height / 2 + 72
+        self.canvas.create_rectangle(
+            width / 2 - 310, top, width / 2 + 310, bottom,
+            fill="#090b11", outline=event_color, width=3,
+        )
+        label = "追加イベント発生" if self.dungeon_number > 1 else "ステージイベント発生"
+        self.canvas.create_text(
+            width / 2, top + 30, text=label,
+            fill="#d8dce7", font=("Yu Gothic UI", 11, "bold"),
+        )
+        self.canvas.create_text(
+            width / 2, top + 68, text=event_name,
+            fill=event_color, font=("Yu Gothic UI", 23, "bold"),
+        )
+        self.canvas.create_text(
+            width / 2, bottom - 24, text=event_effect,
+            fill="#eee6d6", font=("Yu Gothic UI", 11),
         )
 
     def _draw_help_screen(self, width: int, height: int) -> None:
@@ -2460,10 +2707,49 @@ class DarkRuins2D:
             else f"第{self.dungeon_number}遺跡：灯火の小瓶を探して封印を解く"
         )
         self.canvas.create_text(34, 168 + offset_y, anchor="w", text=objective, fill="#9fc3e8", font=("Yu Gothic UI", 10))
+        event_rows = [STAGE_EVENTS[event] for event in self.stage_events]
+        event_bottom = 16 + 28 * len(event_rows)
+        self.canvas.create_rectangle(
+            width / 2 - 205, 16, width / 2 + 205, event_bottom,
+            fill="#090b11", outline="#72664d", width=2,
+        )
+        for index, (event_name, event_effect, event_color) in enumerate(event_rows):
+            prefix = "ステージイベント" if index == 0 else "追加イベント"
+            self.canvas.create_text(
+                width / 2, 30 + index * 28,
+                text=f"{prefix}：{event_name} － {event_effect}",
+                fill=event_color, font=("Yu Gothic UI", 10, "bold"),
+            )
         if time.perf_counter() < self.message_until:
             message_top = 24 if hud_bottom else height - 72
             self.canvas.create_rectangle(180, message_top, width - 180, message_top + 48, fill="#090b11", outline="#72664d", width=2)
             self.canvas.create_text(width / 2, message_top + 24, text=self.message, fill="#f2d992", font=("Yu Gothic UI", 13, "bold"))
+
+    def _draw_fog(
+        self, width: int, height: int, player_x: float, player_y: float,
+    ) -> None:
+        """Darken the area outside the player view with four cheap draw calls."""
+        radius, fade = 190, 30
+        inner_left = max(0.0, player_x - radius)
+        inner_right = min(float(width), player_x + radius)
+        inner_top = max(0.0, player_y - radius)
+        inner_bottom = min(float(height), player_y + radius)
+        outer_left = max(0.0, inner_left - fade)
+        outer_right = min(float(width), inner_right + fade)
+        outer_top = max(0.0, inner_top - fade)
+        outer_bottom = min(float(height), inner_bottom + fade)
+        solid = {"fill": "#05070b", "outline": ""}
+        soft = {"fill": "#05070b", "outline": "", "stipple": "gray50"}
+        # Eight rectangles are inexpensive for Tk while the inner stippled
+        # band prevents the optimized square view from ending abruptly.
+        self.canvas.create_rectangle(0, 0, width, outer_top, **solid)
+        self.canvas.create_rectangle(0, outer_bottom, width, height, **solid)
+        self.canvas.create_rectangle(0, outer_top, outer_left, outer_bottom, **solid)
+        self.canvas.create_rectangle(outer_right, outer_top, width, outer_bottom, **solid)
+        self.canvas.create_rectangle(outer_left, outer_top, outer_right, inner_top, **soft)
+        self.canvas.create_rectangle(outer_left, inner_bottom, outer_right, outer_bottom, **soft)
+        self.canvas.create_rectangle(outer_left, inner_top, inner_left, inner_bottom, **soft)
+        self.canvas.create_rectangle(inner_right, inner_top, outer_right, inner_bottom, **soft)
 
     def _draw_minimap(self, width: int, height: int) -> None:
         size = min(210, max(150, height - 120))
@@ -2476,6 +2762,18 @@ class DarkRuins2D:
             left - 5, top - 5, left + size + 5, top + size + 24,
             fill="#080a0f", outline="#596171", width=2,
         )
+        if "fog" in self.stage_events:
+            self.canvas.create_rectangle(
+                left, top, left + size, top + size,
+                fill="#05070b", outline="#252b35",
+            )
+            self.canvas.create_text(
+                left + size / 2, top + size / 2,
+                text="濃霧により\n地図を確認できない",
+                fill="#9fb8c8", font=("Yu Gothic UI", 11, "bold"),
+                justify="center",
+            )
+            return
         for wx, wy, ww, wh in self.walls:
             self.canvas.create_rectangle(
                 mx(wx), my(wy), mx(wx + ww), my(wy + wh),

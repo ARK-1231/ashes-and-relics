@@ -70,6 +70,8 @@ class Enemy:
     max_hp: int = 0
     shield: int = 0
     max_shield: int = 0
+    revived_once: bool = False
+    summoned: bool = False
 
     def __post_init__(self) -> None:
         if self.max_hp <= 0:

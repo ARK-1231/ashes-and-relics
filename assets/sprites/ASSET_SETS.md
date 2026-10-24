@@ -16,6 +16,8 @@ without the added outlines.
 - `player/source_v3/`: authored player animation sheets.
 - `player/player_basic_sheet*.png`: legacy sheet artwork retained for reference.
 - `enemies/source_v1/`: authored enemy source sheets.
+- `enemies/source_v2/ruined_knight_walk_sheet.png`: complete 4-direction,
+  16-frame ruined-knight walking source generated from the authored reference.
 - `archive/legacy_sprite_sets_2026-08-29.zip`: compressed archive of the oldest
   player and enemy frame sets. The unpacked legacy frame directories were removed
   after the archive checksum was verified.

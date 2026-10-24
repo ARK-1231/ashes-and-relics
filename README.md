@@ -6,23 +6,15 @@ Python標準のTkinterで動く、見下ろし型2Dダーク幻想RPGです。�
 
 コマンドは、このREADMEがあるプロジェクトのフォルダーで実行してください。
 
-### 同梱のPythonを使う場合（Windows）
-
-```powershell
-.\.python313\python.exe .\src\dark_ruins_rpg.py
-```
-
-同梱のPython 3.13で動作確認しています。VS Codeでは、`Ctrl + Shift + P` → `Python: Select Interpreter`から、プロジェクト内の`.python313\python.exe`を選択してください。
-
-### 自分のPythonを使う場合
-
-Python 3.10以降とTcl/Tkが必要です。Tkinterが使える環境で実行してください。
+Python 3.10以降とTcl/Tkが必要です。Tkinterを含むPython環境で実行してください。
 
 ```powershell
 python .\src\dark_ruins_rpg.py
 ```
 
 追加パッケージのインストールは不要です。`requirements.txt`にも外部依存はありません。効果音はWindowsの`winsound`を使用し、対応しない環境では無音になります。
+
+VS Codeでは、`Ctrl + Shift + P` → `Python: Select Interpreter`から、Tkinterを利用できるPythonを選択してください。
 
 ## ゲームの流れ
 
@@ -32,6 +24,27 @@ python .\src\dark_ruins_rpg.py
 4. 第1・第2遺跡のボスを倒すと、約1秒後に進行状況を引き継いで次の遺跡へ進みます。第3遺跡のボスを倒すとクリアです。
 
 遺物・仲間・碑文で集めた真相度によって、通常エンド・断片エンド・真相エンドに分岐します。
+
+## ステージイベント
+
+ステージ生成時にイベントが1つ抽選されます。次の階層へ進むたびに、それまでの効果を引き継いだまま、重複しないイベントが1つ追加されます。第3遺跡では最大3種類が同時に発生します。追加抽選では「静穏」は選ばれません。発生中のイベントは画面上部にすべて表示されます。
+
+| イベント | 効果 |
+| --- | --- |
+| 静穏 | 特別な変化なし |
+| 濃霧 | プレイヤー周辺以外を完全に遮蔽。ミニマップの地形・敵・遺物も確認不能 |
+| 堅牢な群れ | 通常敵とボスのHPが35%増加。ボスのシールドも35%増加 |
+| 凶暴化 | 通常敵とボスの攻撃力が30%増加 |
+| 影走り | 通常敵とボスの移動速度が25%増加 |
+| 群体発生 | 通常敵が5体増加 |
+| 双王の影 | 低確率で発生。守護者が2体出現し、両方の撃破が必要 |
+| 不死者の契約 | 通常敵が倒されてから3秒後、HP50%で一度だけ復活 |
+| 血の代償 | プレイヤーの攻撃力が25%上昇。攻撃ごとにHPを2消費（HP1で停止） |
+| 守護者の号令 | ボス戦中、9秒ごとに守護者1体につき灰の兵士1体を召喚。同時召喚数は最大10体 |
+
+複数イベントの効果は同時に適用されます。ただし極端な組み合わせでは補正が入り、「堅牢な群れ＋凶暴化」はHP25%・攻撃力20%増加、「濃霧＋影走り」は速度15%増加、「不死者の契約＋群体発生」はHP35%で復活します。「双王の影＋守護者の号令」では召喚間隔が12秒、同時召喚数が6体となり、2体の守護者が交互に援軍を呼びます。同じ生成配置へ再挑戦した場合、イベントも同じ内容になります。
+
+新しい階層では追加イベントの名前と効果が中央に4秒間表示されます。不死者の復活地点には残り時間付きの緑色マーカー、守護者の召喚前には2秒間の橙色予告リングが表示されます。
 
 ## 操作
 
@@ -106,7 +119,7 @@ python .\src\dark_ruins_rpg.py
 
 - 主人公と通常敵には、待機・歩行・攻撃の4方向アニメーションがあります。
 - 床・壁はタイル画像、ボスは透過PNGを使用します。
-- HP・シールド・回避の再使用時間・遺物・真相度・ミニマップを表示します。
+- HP・シールド・回避の再使用時間・遺物・真相度・発生中のイベント・ミニマップを表示します。濃霧中はミニマップ情報が遮断されます。
 - 主人公の空振り音・命中音と、ボスの技ごとの発動音があります。ボスの音には低音の衝撃、金属音、短い残響を重ねています。
 - 効果音は非同期再生です。同時再生は1音で、新しい音が前の音を置き換えます。
 - 描画部品の再利用と待ち時間の調整で描画負荷を軽減しています。命中時の停止演出中も移動・回避を反映します。
@@ -123,9 +136,9 @@ python .\src\dark_ruins_rpg.py
 | `assets/sprites/boss/attacks/` | ボスの攻撃6枚 |
 | `assets/sprites/boss/walk/` | ボスの歩行4枚 |
 | `assets/sprites/boss_projectiles/` | ボスの飛び道具80枚（5種類×16方向） |
-| `assets/sounds/` | WAV効果音11種類 |
+| `assets/sounds/` | WAV効果音13種類 |
 
-主人公・通常敵は、欠けていた新版の代わりに同梱アーカイブから復元した旧版を使用しています。詳しくは[素材一覧](assets/sprites/ASSET_SETS.md)、[攻撃画像](assets/sprites/boss/ATTACKS.md)、[歩行画像](assets/sprites/boss/WALK.md)、[効果音](assets/sounds/README.md)を参照してください。
+主人公・通常敵は、欠けていた新版の代わりに同梱アーカイブから復元した旧版を使用しています。廃騎士の歩行画像は、作者用シートを参照して作成した完全な4方向16コマへ更新しています。原本は`assets/sprites/enemies/source_v2/ruined_knight_walk_sheet.png`、分割処理は`tools/install_ruined_knight_walk.ps1`です。詳しくは[素材一覧](assets/sprites/ASSET_SETS.md)、[攻撃画像](assets/sprites/boss/ATTACKS.md)、[歩行画像](assets/sprites/boss/WALK.md)、[効果音](assets/sounds/README.md)を参照してください。
 
 ## プログラム構成
 
@@ -143,8 +156,8 @@ python .\src\dark_ruins_rpg.py
 ## 動作確認
 
 ```powershell
-.\.python313\python.exe .\tools\validate_sprites.py
-.\.python313\python.exe .\src\dark_ruins_rpg.py --smoke-test
+python .\tools\validate_sprites.py
+python .\src\dark_ruins_rpg.py --smoke-test
 ```
 
 素材検証は主人公・通常敵の枚数や寸法、画像の透明部分、床・壁、Pythonソースの文字コードなどを調べます。ボス画像と音声はこの検証の対象外です。
@@ -154,11 +167,11 @@ python .\src\dark_ruins_rpg.py
 効果音を作り直す場合は次を実行します。既存のWAVファイルが更新されます。
 
 ```powershell
-.\.python313\python.exe .\tools\generate_combat_sounds.py
+python .\tools\generate_combat_sounds.py
 ```
 
 ## 起動できない場合
 
-`No Python at ...`は、仮想環境が存在しないPythonの場所を参照しているときに発生します。同梱の`.python313\python.exe`を直接指定するか、利用するPythonから仮想環境を作り直してください。VS Codeで選択しているPythonも確認してください。
+`No Python at ...`は、仮想環境が存在しないPythonの場所を参照しているときに発生します。Pythonをインストールするか、利用するPythonから仮想環境を作り直してください。VS Codeで選択しているPythonも確認してください。
 
 `Can't find a usable init.tcl`が出る場合は、使用しているPythonのTcl/Tk環境を確認してください。Pythonを自分でインストールする場合は、Tcl/Tkを含めてインストールする必要があります。

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import struct
 import sys
 import zlib
@@ -115,6 +116,17 @@ def validate_enemies(root: Path) -> list[str]:
         body_height = max((y for _, y in central), default=-1) - min((y for _, y in central), default=0) + 1
         if len(central) < 450 or body_height < 35:
             errors.append(f"{path}: probable missing body ({len(central)} pixels, {body_height}px high)")
+    knight_walk = root / "ruined_knight"
+    for direction in ("down", "up", "left", "right"):
+        paths = sorted((knight_walk / direction / "walk").glob("*.png"))
+        hashes = {hashlib.sha256(path.read_bytes()).digest() for path in paths}
+        if len(hashes) != 4:
+            errors.append(f"ruined knight {direction} walk: expected four distinct frames")
+        for path in paths:
+            _, _, alpha = read_alpha(path)
+            pixels = opaque_bounds(alpha)[4]
+            if pixels < 700:
+                errors.append(f"{path}: clipped walking pose ({pixels} opaque pixels)")
     return errors
 
 
