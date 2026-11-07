@@ -4,6 +4,9 @@ import random
 import sys
 import time
 import tkinter as tk
+from tkinter import messagebox
+from game_options import GameOptions, WEAPONS, volume_sound
+from exploration import Exploration, CELL_SIZE
 from pathlib import Path
 from ally_navigation import find_path
 from boss_attacks import create_fan, create_lance, create_ring, create_spiral, create_wave
@@ -59,10 +62,21 @@ RELIC_KEYS = (
 )
 BOSS_PROJECTILE_STYLES = ("fan", "ring", "lance", "spiral", "wave")
 BOSS_PROJECTILE_DIRECTIONS = 16
+ATTACK_FORECAST_COLORS = {
+    "melee": "#ff8282",       # Red: melee
+    "ranged": "#92baff",      # Blue: ordinary ranged attack
+    "charge": "#99e5ac",      # Green: charge
+    "boss_fan": "#c59aff",    # Purple: fan
+    "boss_ring": "#ff9dd2",   # Pink: ring
+    "boss_lance": "#88e7ef",  # Cyan: lance
+    "boss_spiral": "#ffc18a", # Orange: spiral
+    "boss_wave": "#f5e58a",   # Yellow: wave
+}
 PLAYER_ATTACK_RADIUS = 110
 ALLY_SHIELD_AMOUNT = 20
 ALLY_SHIELD_PER_EXTRA_ALLY = 5
 ALLY_SHIELD_COOLDOWN = 12.0
+
 PLAYER_ATTACK_HALF_ANGLE = math.pi / 3
 
 # One condition is rolled from the stage seed whenever a new ruin is created.
@@ -73,7 +87,7 @@ STAGE_EVENTS = {
     "fortified": ("堅牢な群れ", "敵のHPが35%増加", "#e0a866"),
     "ferocious": ("凶暴化", "敵の攻撃力が30%増加", "#ef6f65"),
     "haste": ("影走り", "敵の移動速度が25%増加", "#c88cff"),
-    "swarm": ("群体発生", "通常敵が5体増加", "#d7c56b"),
+    "swarm": ("群体発生", "通常敵が10体増加", "#d7c56b"),
     "twin_boss": ("双王の影", "守護者が2体出現", "#ff83c6"),
     "undying": ("不死者の契約", "通常敵が一度だけ復活", "#80d6a6"),
     "blood_price": ("血の代償", "攻撃力+25%・攻撃時HP-2", "#ff596f"),
@@ -169,6 +183,8 @@ class DarkRuins2D:
         self.boss_walk_sprites = self._load_boss_walk_sprites()
         self.boss_projectile_sprites = self._load_boss_projectile_sprites()
 
+        self.options = GameOptions()
+        self.weapon = "sword"
         self.retry_used = False
         self._reset_game()
         self.ui_mode = "title"
@@ -454,31 +470,35 @@ class DarkRuins2D:
         return self.boss_sprite
 
     def _load_enemy_sprites(self) -> dict[str, dict[str, list[tk.PhotoImage]]]:
-        """Load the normalized basic animation sets for the three regular enemies."""
+        """Load complete sets independently; one missing asset cannot disable others."""
         root = Path(__file__).resolve().parent.parent / "assets" / "sprites" / "enemies" / "frames_v6"
         enemy_ids = {
             "灰の兵士": "ash_soldier",
             "廃騎士": "ruined_knight",
             "さまよう影": "wandering_shadow",
+            "灰の突撃兵": "ash_charger",
+            "灰の祈祷師": "ash_healer",
+            "盾の廃騎士": "shield_knight",
         }
         loaded: dict[str, dict[str, list[tk.PhotoImage]]] = {}
-        try:
-            for enemy_name, enemy_id in enemy_ids.items():
-                loaded[enemy_name] = {}
+        for enemy_name, enemy_id in enemy_ids.items():
+            frame_root = root if enemy_id in {"ash_soldier", "ruined_knight", "wandering_shadow"} else root.parent / "frames_added_v1"
+            try:
+                animations = {}
                 for direction in ("up", "down", "left", "right"):
                     for animation in ("idle", "walk", "attack"):
-                        key = f"{animation}_{direction}"
-                        frame_paths = [
-                            root / enemy_id / direction / animation / f"{index:02}.png"
-                            for index in range(1, 5)
-                        ]
-                        loaded[enemy_name][key] = [
-                            tk.PhotoImage(file=str(path)) for path in frame_paths
-                        ]
-            return loaded
-        except (tk.TclError, OSError) as exc:
-            print(f"Could not load enemy animation: {exc}", file=sys.stderr)
-            return {}
+                        frames = []
+                        for index in range(1, 5):
+                            path = frame_root / enemy_id / direction / animation / f"{index:02}.png"
+                            image = tk.PhotoImage(master=self.root, file=str(path))
+                            if (image.width(), image.height()) != (96, 96):
+                                raise ValueError(f"Expected 96x96 enemy frame: {path}")
+                            frames.append(image)
+                        animations[f"{animation}_{direction}"] = frames
+                loaded[enemy_name] = animations
+            except (tk.TclError, OSError, ValueError) as exc:
+                print(f"Could not load enemy {enemy_id}: {exc}", file=sys.stderr)
+        return loaded
 
     def _enemy_sprite(self, enemy: Enemy) -> tk.PhotoImage | None:
         sprites = self.enemy_sprites.get(enemy.name)
@@ -540,6 +560,7 @@ class DarkRuins2D:
         self.dungeon_number = progress["dungeon_number"] if progress else 1
         self.keys: set[str] = set()
         self.px, self.py = stage(960), stage(1840)
+        self.exploration = Exploration()
         self.facing = (0.0, -1.0)
         self.attack_direction = self.facing
         self.dodge_direction = self.facing
@@ -764,18 +785,21 @@ class DarkRuins2D:
         tier = self.dungeon_number - 1
         stage_events = set(getattr(self, "stage_events", (getattr(self, "stage_event", "calm"),)))
         event_hp, event_damage, event_speed = self._event_enemy_multipliers(stage_events)
-        hp_scale = (1.0 + tier * 0.45) * event_hp
-        damage_scale = (1.0 + tier * 0.25) * event_damage
-        speed_scale = (1.0 + tier * 0.07) * event_speed
+        hp_scale = (1.0 + tier * 0.70) * event_hp
+        damage_scale = (1.0 + tier * 0.40) * event_damage
+        speed_scale = (1.0 + tier * 0.10) * event_speed
         specs = (
-            [("灰の兵士", 45, 10, 95, 23, "#9e3129")] * 8
-            + [("廃騎士", 70, 16, 78, 29, "#6f2623")] * 4
+            [("灰の兵士", 45, 10, 95, 23, "#9e3129")] * 5
+            + [("灰の突撃兵", 50, 13, 100, 23, "#db7945")] * 2
+            + [("灰の祈祷師", 38, 8, 75, 22, "#68c98e")]
+            + [("廃騎士", 70, 16, 78, 29, "#6f2623")] * 2
+            + [("盾の廃騎士", 80, 14, 68, 29, "#85a4bc")] * 2
             + [("さまよう影", 32, 14, 125, 20, "#63377d")] * 5
         )
         if "swarm" in stage_events:
             specs += (
-                [("灰の兵士", 45, 10, 95, 23, "#9e3129")] * 3
-                + [("さまよう影", 32, 14, 125, 20, "#63377d")] * 2
+                [("灰の兵士", 45, 10, 95, 23, "#9e3129")] * 6
+                + [("さまよう影", 32, 14, 125, 20, "#63377d")] * 4
             )
         occupied = [(self.px, self.py)] + [(r.x, r.y) for r in self.relics]
         enemies = []
@@ -791,10 +815,11 @@ class DarkRuins2D:
                 speed * speed_scale,
                 radius, color,
                 ranged=name == "さまよう影",
+                behavior={"灰の突撃兵": "charger", "灰の祈祷師": "healer", "盾の廃騎士": "shield"}.get(name, "normal"),
             ))
-        boss_hp = 240 + tier * 180
-        boss_damage = 22 + tier * 9
-        boss_shield = round(180 * (1.0 + tier * 0.45))
+        boss_hp = 240 + tier * 240
+        boss_damage = 22 + tier * 12
+        boss_shield = round(180 * (1.0 + tier * 0.70))
         boss_hp = round(boss_hp * event_hp)
         boss_shield = round(boss_shield * event_hp)
         boss_damage = round(boss_damage * event_damage)
@@ -914,7 +939,13 @@ class DarkRuins2D:
     # ------------------------------------------------------------------
 
     def _key_down(self, event: tk.Event) -> None:
+        if self.ui_mode == "settings":
+            return
         key = event.keysym.lower()
+        if key == "f2" and self.ui_mode in {"title", "playing", "paused"}:
+            self._open_settings()
+            return
+        key = self.options.bindings.get(key, key)
         if self.ui_mode != "playing":
             self._handle_menu_key(key)
             return
@@ -926,6 +957,10 @@ class DarkRuins2D:
         if self.game_over and key in {"r", "n"}:
             self._restart(new_stage=key == "n")
             return
+        if key == "q" and key not in self.keys and not self.game_over and self.attack_cd == 0:
+            names = tuple(WEAPONS)
+            self.weapon = names[(names.index(self.weapon) + 1) % len(names)]
+            self._say(f"武器を{self._weapon_stats()[0]}に切り替えた。")
         self.keys.add(key)
         if key in {"f", "return"}:
             self._attack()
@@ -980,6 +1015,147 @@ class DarkRuins2D:
             else:
                 self.root.destroy()
 
+    def _update_enemy_ability(self, enemy, distance, dt):
+        if enemy.behavior == "shield":
+            desired = math.atan2(self.py-enemy.y, self.px-enemy.x)
+            delta = (desired-enemy.guard_angle+math.pi) % math.tau-math.pi
+            enemy.guard_angle += max(-1.4*dt, min(1.4*dt, delta))
+        if enemy.behavior == "healer" and distance < 600 and enemy.ability_cd == 0:
+            targets = [other for other in self.enemies if other is not enemy
+                       and not other.boss and 0 < other.hp < other.max_hp
+                       and self._distance(enemy.x, enemy.y, other.x, other.y) < 260
+                       and not self._line_blocked(enemy.x, enemy.y, other.x, other.y)]
+            if targets:
+                target = min(targets, key=lambda other: other.hp/other.max_hp)
+                target.hp = min(target.max_hp, target.hp + 15)
+                enemy.ability_cd = 5.0
+                self._spawn_visual_effect(target.x, target.y, "#79eea4", 8, 35, "#79eea4", 0)
+                self._say("灰の祈祷師が仲間を回復した！", 1.5)
+        if enemy.behavior != "charger":
+            return False
+        if enemy.charge_time > 0:
+            duration = min(dt, enemy.charge_time)
+            enemy.charge_time = max(0, enemy.charge_time-dt)
+            steps = max(1, math.ceil(480*duration/6))
+            for _ in range(steps):
+                nx = enemy.x + enemy.charge_dx*480*duration/steps
+                ny = enemy.y + enemy.charge_dy*480*duration/steps
+                if self._blocked(nx, ny, enemy.radius):
+                    enemy.charge_time = 0
+                    break
+                enemy.x, enemy.y = nx, ny
+                enemy.moving = True
+                if self._distance(self.px, self.py, nx, ny) <= enemy.radius+PLAYER_RADIUS:
+                    if not self.dodge_time:
+                        self._damage_player(enemy.damage+6, "突撃を受けた！", nx, ny)
+                    enemy.charge_time = 0
+                    break
+            enemy.walk_time += duration
+            return True
+        if 130 < distance < 420 and enemy.ability_cd == 0 and not self._line_blocked(enemy.x, enemy.y, self.px, self.py, enemy.radius):
+            self._start_enemy_attack(enemy, "charge", 0.8)
+            return True
+        return False
+
+    def _weapon_stats(self):
+        return WEAPONS[getattr(self, "weapon", "sword")]
+
+    def _draw_enemy_forecast(self, enemy, sx, sy):
+        """Show melee reach and the actual initial projectile lanes."""
+        kind = enemy.pending_attack
+        color = ATTACK_FORECAST_COLORS.get(kind, "#d5d9e2")
+        if kind == "melee":
+            radius = enemy.radius + (130 if enemy.boss else 55)
+            self.canvas.create_oval(sx(enemy.x-radius), sy(enemy.y-radius),
+                                    sx(enemy.x+radius), sy(enemy.y+radius),
+                                    fill=color, stipple="gray12", outline="", width=1)
+        elif kind in {"ranged", "charge"}:
+            angle = math.atan2(enemy.aim_y-enemy.y, enemy.aim_x-enemy.x)
+            length = 264 if kind == "charge" else 330 * 1.25
+            self.canvas.create_line(sx(enemy.x), sy(enemy.y),
+                                    sx(enemy.x+math.cos(angle)*length), sy(enemy.y+math.sin(angle)*length),
+                                    fill=color,
+                                    width=enemy.radius*2 if kind == "charge" else 16,
+                                    stipple="gray12", arrow="last")
+        else:
+            factory = {"boss_fan": create_fan, "boss_ring": create_ring,
+                       "boss_lance": create_lance, "boss_spiral": create_spiral,
+                       "boss_wave": create_wave}.get(kind)
+            if factory:
+                key = (kind, enemy.x, enemy.y, enemy.aim_x, enemy.aim_y,
+                       enemy.boss_phase, enemy.radius, enemy.damage)
+                if getattr(enemy, "_forecast_key", None) != key:
+                    enemy._forecast_shots = factory(enemy, enemy.aim_x, enemy.aim_y)
+                    enemy._forecast_key = key
+                for shot in enemy._forecast_shots:
+                    length = 0.65 if kind == "boss_spiral" else 1.25
+                    self.canvas.create_line(sx(shot.x), sy(shot.y),
+                                            sx(shot.x+shot.vx*length), sy(shot.y+shot.vy*length),
+                                            fill=color,
+                                            width=shot.radius*2, stipple="gray12", arrow="last")
+        label = "（初期方向・発射後に旋回）" if kind == "boss_spiral" else ""
+        self.canvas.create_text(sx(enemy.x), sy(enemy.y)-enemy.radius-48,
+                                text=f"発動まで {enemy.windup:.1f}秒{label}", fill=color)
+
+    def _open_settings(self):
+        previous_mode = self.ui_mode
+        self.ui_mode = "settings"
+        self.keys.clear()
+        dialog = tk.Toplevel(self.root)
+        dialog.title("設定")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        difficulty = tk.StringVar(value=self.options.difficulty)
+        volume = tk.IntVar(value=self.options.volume)
+        shake = tk.BooleanVar(value=self.options.shake)
+        tk.Label(dialog, text="難易度（被ダメージに即時反映）").pack(padx=24, pady=8)
+        tk.OptionMenu(dialog, difficulty, "やさしい", "標準", "難しい").pack()
+        tk.Scale(dialog, from_=0, to=100, orient="horizontal", variable=volume,
+                 label="効果音の音量", length=280).pack(pady=8)
+        tk.Checkbutton(dialog, text="画面揺れを有効にする", variable=shake).pack()
+        tk.Label(dialog, text="キー割り当て：欄を選んでキーを押す\n移動はWASD／矢印キー、F2は設定専用").pack(pady=8)
+        entries = {}
+        for action, label in (("f", "攻撃"), ("space", "回避"), ("e", "調べる"), ("q", "武器切替")):
+            row = tk.Frame(dialog)
+            row.pack(pady=3)
+            tk.Label(row, text=label, width=12).pack(side="left")
+            value = tk.StringVar(value=next((k for k, v in self.options.bindings.items() if v == action), action))
+            field = tk.Entry(row, textvariable=value, state="readonly", width=18)
+            field.pack(side="left")
+            field.bind("<KeyPress>", lambda event, var=value: (var.set(event.keysym.lower()), "break")[1])
+            entries[action] = value
+
+        def close():
+            self.ui_mode = previous_mode
+            self.keys.clear()
+            self.last_time = time.perf_counter()
+            dialog.destroy()
+
+        def apply():
+            keys = [value.get() for value in entries.values()]
+            reserved = {"w", "a", "s", "d", "up", "down", "left", "right", "escape", "p", "f2", "return", "r", "n", *map(str, range(1, 10))}
+            if len(set(keys)) != len(keys) or any(k in reserved for k in keys):
+                messagebox.showerror("キー割り当て", "キーの重複、移動・メニュー用キーは使用できません。", parent=dialog)
+                return
+            bindings = {action: "unbound_" + action for action in entries}
+            bindings.update({value.get(): action for action, value in entries.items()})
+            self.options.bindings = bindings
+            self.options.difficulty = difficulty.get()
+            self.options.volume = volume.get()
+            self.options.shake = shake.get()
+            if self.options.volume == 0:
+                try:
+                    import winsound
+                    winsound.PlaySound(None, 0)
+                except (ImportError, RuntimeError):
+                    pass
+            close()
+
+        tk.Button(dialog, text="適用して戻る", command=apply).pack(pady=12)
+        tk.Button(dialog, text="キャンセル", command=close).pack(pady=4)
+        dialog.protocol("WM_DELETE_WINDOW", close)
+        dialog.bind("<Escape>", lambda event: close())
+
     def _restart(self, new_stage: bool) -> None:
         if not new_stage and getattr(self, "retry_used", False):
             self._say("同じステージへの再挑戦は1回までです。N: 新しい遺跡  Esc: 終了", 999)
@@ -1002,7 +1178,8 @@ class DarkRuins2D:
         return "R: 再挑戦  N: 新しい遺跡  Esc: 終了"
 
     def _key_up(self, event: tk.Event) -> None:
-        self.keys.discard(event.keysym.lower())
+        key = event.keysym.lower()
+        self.keys.discard(self.options.bindings.get(key, key))
 
     def _aim_with_mouse(self, event: tk.Event) -> None:
         """Turn the player toward the mouse cursor."""
@@ -1098,6 +1275,8 @@ class DarkRuins2D:
 
         self._update_boss_gate()
         self._collect_relics()
+        self.exploration.update(self.px, self.py, WORLD_SIZE, self._line_blocked,
+                                (self.door_open, self.boss_gate_locked))
         self._interact()
         self._update_ally(dt)
         self._update_ally_bolts(dt)
@@ -1134,7 +1313,8 @@ class DarkRuins2D:
             self.dodge_direction = (
                 (cursor_dx / length, cursor_dy / length) if length > 1 else self.facing
             )
-            self.dodge_time, self.dodge_cd = DODGE_DURATION, DODGE_COOLDOWN
+            self.dodge_time = DODGE_DURATION
+            self.dodge_cd = DODGE_COOLDOWN
         if self.dodge_time:
             dx, dy = self.dodge_direction
             self.facing = self.dodge_direction
@@ -1329,6 +1509,10 @@ class DarkRuins2D:
             companion.path = self._find_ally_path(companion, target_x, target_y)
             companion.path_timer = 0.35
         if companion.path:
+            for index in range(len(companion.path) - 1, 0, -1):
+                if not self._line_blocked(companion.x, companion.y, *companion.path[index], 18):
+                    del companion.path[:index]
+                    break
             waypoint_x, waypoint_y = companion.path[0]
             if self._distance(companion.x, companion.y, waypoint_x, waypoint_y) < 14:
                 companion.path.pop(0)
@@ -1468,6 +1652,9 @@ class DarkRuins2D:
                 self._summon_boss_reinforcements()
                 self.boss_summon_timer = 12.0 if "twin_boss" in self.stage_events else 9.0
         for enemy in self.enemies:
+            if enemy.hp <= 0:
+                continue
+            enemy.ability_cd = max(0.0, enemy.ability_cd - dt)
             enemy.cooldown = max(0.0, enemy.cooldown - dt)
             enemy.attack_pose_time = max(0.0, enemy.attack_pose_time - dt)
             enemy.moving = False
@@ -1482,7 +1669,7 @@ class DarkRuins2D:
                 enemy.hp = enemy.max_hp
                 enemy.shield = enemy.max_shield
                 event_speed = self._event_enemy_multipliers(set(self.stage_events))[2]
-                enemy.speed = 88 * (1.0 + (self.dungeon_number - 1) * 0.07) * event_speed
+                enemy.speed = 88 * (1.0 + (self.dungeon_number - 1) * 0.10) * event_speed
                 enemy.cooldown = 0.7
                 self._spawn_visual_effect(
                     enemy.x, enemy.y, "#df65ff", 30, 135, "#b22cff", 0.22,
@@ -1496,6 +1683,8 @@ class DarkRuins2D:
                     self._release_enemy_attack(enemy)
                 continue
             distance = self._distance(self.px, self.py, enemy.x, enemy.y)
+            if self._update_enemy_ability(enemy, distance, dt):
+                continue
             # Keep the boss's full move set available at the edge of melee
             # range. Only a true point-blank approach forces a melee cleave.
             boss_special_min_range = enemy.radius + 60
@@ -1556,6 +1745,8 @@ class DarkRuins2D:
             enemy.cooldown = 0.8
             enemy.windup = 0.0
             enemy.pending_attack = ""
+            enemy.charge_time = 0.0
+            enemy.ability_cd = max(enemy.ability_cd, 0.8)
             self.enemies.append(enemy)
             self._spawn_visual_effect(
                 enemy.x, enemy.y, "#79e0a1", 16, 72, "#b9ffd1", 0.12,
@@ -1572,9 +1763,9 @@ class DarkRuins2D:
             return
         tier = self.dungeon_number - 1
         event_hp, event_damage, event_speed = self._event_enemy_multipliers(set(self.stage_events))
-        hp_scale = (1.0 + tier * 0.45) * event_hp
-        damage_scale = (1.0 + tier * 0.25) * event_damage
-        speed_scale = (1.0 + tier * 0.07) * event_speed
+        hp_scale = (1.0 + tier * 0.70) * event_hp
+        damage_scale = (1.0 + tier * 0.40) * event_damage
+        speed_scale = (1.0 + tier * 0.10) * event_speed
         spawned = 0
         # With two bosses, alternate the caller instead of doubling every wave.
         summoners = [self.rng.choice(bosses)] if twin_command else bosses
@@ -1620,6 +1811,14 @@ class DarkRuins2D:
 
     def _release_enemy_attack(self, enemy: Enemy) -> None:
         attack_type = enemy.pending_attack
+        if attack_type == "charge":
+            distance = max(1, self._distance(enemy.x, enemy.y, enemy.aim_x, enemy.aim_y))
+            enemy.charge_dx = (enemy.aim_x - enemy.x) / distance
+            enemy.charge_dy = (enemy.aim_y - enemy.y) / distance
+            enemy.charge_time = 0.55
+            enemy.pending_attack = ""
+            enemy.cooldown = enemy.ability_cd = 3.5
+            return
         if enemy.boss:
             self._play_sound("boss_melee" if attack_type == "melee" else attack_type)
             enemy.attack_pose = attack_type
@@ -1682,6 +1881,7 @@ class DarkRuins2D:
             + (7 if self.skill == "wing" else 0)
             + (10 if self.skill == "ward" else 0)
         )
+        base_damage = round(base_damage * getattr(self, "options", GameOptions()).damage_multiplier)
         damage = max(2, base_damage - guard)
         absorbed = min(self.player_shield, damage)
         self.player_shield -= absorbed
@@ -1866,14 +2066,14 @@ class DarkRuins2D:
     def _play_sound(self, cue: str) -> None:
         """Play a short WAV asynchronously so audio never delays input handling."""
         path = Path(__file__).resolve().parent.parent / "assets" / "sounds" / f"{cue}.wav"
-        if not path.is_file():
+        if not path.is_file() or self.options.volume == 0:
             return
         try:
             import winsound
             winsound.PlaySound(
-                str(path), winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT,
+                str(volume_sound(path, self.options.volume)), winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT,
             )
-        except (ImportError, RuntimeError):
+        except (ImportError, RuntimeError, OSError, ValueError):
             # Sound is optional on platforms without the Windows audio backend.
             pass
 
@@ -1942,7 +2142,7 @@ class DarkRuins2D:
             return
         self._aim_at_cursor()
         self.attack_direction = self.facing
-        self.attack_cd = PLAYER_ATTACK_COOLDOWN
+        self.attack_cd = self._weapon_stats()[3]
         self.attack_flash = PLAYER_ATTACK_ANIMATION_DURATION
         if "blood_price" in getattr(self, "stage_events", ()):
             self.hp = max(1, self.hp - 2)
@@ -1962,11 +2162,11 @@ class DarkRuins2D:
         distance = math.hypot(dx, dy)
         angle = math.atan2(dy, dx) - math.atan2(self.attack_direction[1], self.attack_direction[0])
         angle = abs((angle + math.pi) % math.tau - math.pi)
-        if angle <= PLAYER_ATTACK_HALF_ANGLE:
-            return distance <= PLAYER_ATTACK_RADIUS + enemy.radius
+        if angle <= self._weapon_stats()[2]:
+            return distance <= self._weapon_stats()[1] + enemy.radius
         # Outside the angle, overlap with either radial edge still counts.
-        delta = angle - PLAYER_ATTACK_HALF_ANGLE
-        along = min(PLAYER_ATTACK_RADIUS, max(0.0, distance * math.cos(delta)))
+        delta = angle - self._weapon_stats()[2]
+        along = min(self._weapon_stats()[1], max(0.0, distance * math.cos(delta)))
         separation = math.hypot(distance * math.cos(delta) - along,
                                 distance * math.sin(delta))
         return separation <= enemy.radius
@@ -1979,7 +2179,12 @@ class DarkRuins2D:
             "gauntlet": 22,
             "ember": 30,
         }.get(self.skill, 0)
-        damage = self.attack + skill_damage
+        damage = round((self.attack + skill_damage) * self._weapon_stats()[4])
+        if enemy.behavior == "shield":
+            facing = enemy.guard_angle
+            incoming = math.atan2(self.py-enemy.y, self.px-enemy.x)
+            if abs((incoming-facing+math.pi) % math.tau-math.pi) <= math.pi/3:
+                damage = max(1, round(damage * 0.35))
         if self.skill == "lantern" and ("影" in enemy.name or enemy.boss):
             damage += 8
         if "blood_price" in getattr(self, "stage_events", ()):
@@ -2099,6 +2304,9 @@ class DarkRuins2D:
         self.canvas.begin_frame()
         try:
             self._draw_scene()
+            self.canvas.create_text(self.canvas.winfo_width() - 20, self.canvas.winfo_height() - 18,
+                                    anchor="e", text=f"F2: 設定  武器: {self._weapon_stats()[0]}",
+                                    fill="white", font=("Yu Gothic", 11))
         finally:
             self.canvas.end_frame()
 
@@ -2112,7 +2320,7 @@ class DarkRuins2D:
             return
         cam_x = min(max(self.px - width / 2, 0), WORLD_SIZE - width)
         cam_y = min(max(self.py - height / 2, 0), WORLD_SIZE - height)
-        if self.screen_shake_time > 0:
+        if self.screen_shake_time > 0 and self.options.shake:
             cam_x += self.rng.uniform(-self.screen_shake_strength, self.screen_shake_strength)
             cam_y += self.rng.uniform(-self.screen_shake_strength, self.screen_shake_strength)
         sx, sy = lambda x: x - cam_x, lambda y: y - cam_y
@@ -2231,6 +2439,10 @@ class DarkRuins2D:
                 self.ally_candidate_name, sx(self.ally_candidate_x), sy(self.ally_candidate_y),
             )
             actor_sprites.append((sx(self.ally_candidate_x), sy(self.ally_candidate_y), item))
+        # Draw ground warnings before every enemy, including overlapping enemies.
+        for enemy in self.enemies:
+            if enemy.windup > 0:
+                self._draw_enemy_forecast(enemy, sx, sy)
         for enemy in self.enemies:
             # Keep windup indicators: their aim lines can cross the viewport
             # even when the attacking enemy is outside it.
@@ -2239,8 +2451,7 @@ class DarkRuins2D:
                 300 if enemy.boss else 160,
             ):
                 continue
-            warning_on = enemy.windup > 0 and int(enemy.windup * 14) % 2 == 0
-            enemy_color = "#ffd36a" if warning_on else enemy.color
+            enemy_color = enemy.color
             enemy_sprite = self._boss_sprite_for_attack(enemy) if enemy.boss else self._enemy_sprite(enemy)
             if enemy_sprite is not None:
                 item = self.canvas.create_image(
@@ -2250,6 +2461,11 @@ class DarkRuins2D:
                 actor_sprites.append((sx(enemy.x), sy(enemy.y), item))
             else:
                 self._draw_actor(sx(enemy.x), sy(enemy.y), enemy.radius, enemy_color, enemy.name)
+            if enemy.behavior == "shield":
+                r = enemy.radius + 7
+                self.canvas.create_arc(sx(enemy.x)-r, sy(enemy.y)-r, sx(enemy.x)+r, sy(enemy.y)+r,
+                                       start=-math.degrees(enemy.guard_angle)-60, extent=120,
+                                       style="arc", outline="#a8dbff", width=6)
             if (
                 enemy.boss
                 and "boss_command" in self.stage_events
@@ -2267,57 +2483,6 @@ class DarkRuins2D:
                     text=f"召喚 {self.boss_summon_timer:.1f}",
                     fill="#ffd19a", font=("Yu Gothic UI", 10, "bold"),
                 )
-            if enemy.windup > 0:
-                progress = 1.0 - enemy.windup / max(0.001, enemy.windup_max)
-                warning_colors = {
-                    "melee": "#ff554f",
-                    "boss_fan": "#b45cff",
-                    "boss_ring": "#ff5bab",
-                    "boss_lance": "#48e1f2",
-                    "boss_spiral": "#ff943d",
-                    "boss_wave": "#ffe05b",
-                }
-                warning_color = warning_colors.get(enemy.pending_attack, "#d783ff")
-                warning_radius = enemy.radius + (55 if enemy.pending_attack == "melee" else 32)
-                self.canvas.create_oval(
-                    sx(enemy.x) - warning_radius,
-                    sy(enemy.y) - warning_radius,
-                    sx(enemy.x) + warning_radius,
-                    sy(enemy.y) + warning_radius,
-                    outline=warning_color,
-                    width=max(2, round(5 * progress)),
-                    dash=(5, 3),
-                )
-                if enemy.pending_attack in {
-                    "ranged", "boss_fan", "boss_lance", "boss_wave",
-                }:
-                    self.canvas.create_line(
-                        sx(enemy.x), sy(enemy.y),
-                        sx(enemy.aim_x), sy(enemy.aim_y),
-                        fill=warning_color,
-                        width=2 if enemy.pending_attack == "ranged" else 4,
-                        dash=(8, 6),
-                    )
-                elif enemy.pending_attack in {"boss_ring", "boss_spiral"}:
-                    ring_radius = enemy.radius + 45 + 55 * progress
-                    self.canvas.create_oval(
-                        sx(enemy.x) - ring_radius,
-                        sy(enemy.y) - ring_radius,
-                        sx(enemy.x) + ring_radius,
-                        sy(enemy.y) + ring_radius,
-                        outline=warning_color,
-                        width=4,
-                        dash=(4, 4),
-                    )
-                    if enemy.pending_attack == "boss_spiral":
-                        inner_radius = ring_radius * 0.62
-                        self.canvas.create_oval(
-                            sx(enemy.x) - inner_radius,
-                            sy(enemy.y) - inner_radius,
-                            sx(enemy.x) + inner_radius,
-                            sy(enemy.y) + inner_radius,
-                            outline="#ffd09a", width=3, dash=(3, 5),
-                        )
             bar = max(0, enemy.hp) / max(1, enemy.max_hp)
             self.canvas.create_rectangle(sx(enemy.x) - 28, sy(enemy.y) - enemy.radius - 13, sx(enemy.x) + 28, sy(enemy.y) - enemy.radius - 8, fill="#351519", outline="")
             self.canvas.create_rectangle(sx(enemy.x) - 28, sy(enemy.y) - enemy.radius - 13, sx(enemy.x) - 28 + 56 * bar, sy(enemy.y) - enemy.radius - 8, fill="#d14848", outline="")
@@ -2388,10 +2553,10 @@ class DarkRuins2D:
         if self.attack_flash:
             attack_angle = -math.degrees(math.atan2(fy, fx))
             self.canvas.create_arc(
-                sx(self.px) - PLAYER_ATTACK_RADIUS, sy(self.py) - PLAYER_ATTACK_RADIUS,
-                sx(self.px) + PLAYER_ATTACK_RADIUS, sy(self.py) + PLAYER_ATTACK_RADIUS,
-                start=attack_angle - math.degrees(PLAYER_ATTACK_HALF_ANGLE),
-                extent=math.degrees(PLAYER_ATTACK_HALF_ANGLE) * 2,
+                sx(self.px) - self._weapon_stats()[1], sy(self.py) - self._weapon_stats()[1],
+                sx(self.px) + self._weapon_stats()[1], sy(self.py) + self._weapon_stats()[1],
+                start=attack_angle - math.degrees(self._weapon_stats()[2]),
+                extent=math.degrees(self._weapon_stats()[2]) * 2,
                 style="arc", outline="#fff0a6", width=6,
             )
         self._draw_effects(sx, sy, width, height)
@@ -2757,72 +2922,38 @@ class DarkRuins2D:
         scale = size / WORLD_SIZE
         mx = lambda x: left + x * scale
         my = lambda y: top + y * scale
-
-        self.canvas.create_rectangle(
-            left - 5, top - 5, left + size + 5, top + size + 24,
-            fill="#080a0f", outline="#596171", width=2,
-        )
+        self.canvas.create_rectangle(left-5, top-5, left+size+5, top+size+24,
+                                     fill="#080a0f", outline="#596171", width=2)
         if "fog" in self.stage_events:
-            self.canvas.create_rectangle(
-                left, top, left + size, top + size,
-                fill="#05070b", outline="#252b35",
-            )
-            self.canvas.create_text(
-                left + size / 2, top + size / 2,
-                text="濃霧により\n地図を確認できない",
-                fill="#9fb8c8", font=("Yu Gothic UI", 11, "bold"),
-                justify="center",
-            )
+            self.canvas.create_text(left+size/2, top+size/2,
+                                    text="濃霧により地図を確認できない", fill="#9fb8c8")
             return
+        memory = self.exploration
+        self.canvas.create_rectangle(left, top, left+size, top+size, fill="#303541", outline="")
         for wx, wy, ww, wh in self.walls:
-            self.canvas.create_rectangle(
-                mx(wx), my(wy), mx(wx + ww), my(wy + wh),
-                fill="#555b68", outline="",
-            )
+            self.canvas.create_rectangle(mx(wx), my(wy), mx(wx+ww), my(wy+wh), fill="#555b68", outline="")
         if not self.door_open or self.boss_gate_locked:
-            self.canvas.create_rectangle(
-                mx(stage(760)), my(stage(615)),
-                mx(stage(1160)), my(stage(685)),
-                fill="#b34bcf", outline="",
-            )
-
+            self.canvas.create_rectangle(mx(stage(760)), my(stage(615)), mx(stage(1160)), my(stage(685)), fill="#b34bcf", outline="")
+        # Cover unknown terrain before drawing any markers.
+        for x1, y1, x2, y2 in memory.unknown_rectangles(WORLD_SIZE):
+            self.canvas.create_rectangle(mx(x1), my(y1), mx(x2), my(y2),
+                                         fill="#05070b", outline="")
+        def marker(x, y, color, radius=3, label=""):
+            if memory.cell(x, y) not in memory.discovered:
+                return
+            self.canvas.create_oval(mx(x)-radius, my(y)-radius, mx(x)+radius, my(y)+radius, fill=color, outline="")
+            if label:
+                self.canvas.create_text(mx(x)+5, my(y), anchor="w", text=label, fill=color, font=("Yu Gothic UI", 8))
         for relic in self.relics:
             if not relic.collected:
-                self.canvas.create_oval(
-                    mx(relic.x) - 3, my(relic.y) - 3,
-                    mx(relic.x) + 3, my(relic.y) + 3,
-                    fill=relic.color, outline="",
-                )
+                marker(relic.x, relic.y, relic.color)
         for enemy in self.enemies:
-            radius = 4 if enemy.boss else 2
-            self.canvas.create_oval(
-                mx(enemy.x) - radius, my(enemy.y) - radius,
-                mx(enemy.x) + radius, my(enemy.y) + radius,
-                fill="#ee5b55", outline="",
-            )
-
-        self.canvas.create_oval(
-            mx(stage(960)) - 3, my(stage(1660)) - 3,
-            mx(stage(960)) + 3, my(stage(1660)) + 3,
-            fill="#65b8f2", outline="",
-        )
-        self.canvas.create_oval(
-            mx(self.px) - 4, my(self.py) - 4,
-            mx(self.px) + 4, my(self.py) + 4,
-            fill="#ffffff", outline="#74a7e8",
-        )
-
-        cam_x = min(max(self.px - width / 2, 0), WORLD_SIZE - width)
-        cam_y = min(max(self.py - height / 2, 0), WORLD_SIZE - height)
-        self.canvas.create_rectangle(
-            mx(cam_x), my(cam_y), mx(cam_x + width), my(cam_y + height),
-            outline="#9fc3e8",
-        )
-        self.canvas.create_text(
-            left, top + size + 13, anchor="w",
-            text=f"MAP  seed:{self.stage_seed:06d}",
-            fill="#aeb5c4", font=("Consolas", 8),
-        )
+            if memory.cell(enemy.x, enemy.y) in memory.visible and not self._line_blocked(self.px, self.py, enemy.x, enemy.y):
+                marker(enemy.x, enemy.y, "#ee5b55", 4 if enemy.boss else 2)
+        marker(stage(960), stage(1660), "#65b8f2", label="祠")
+        marker(stage(960), stage(230), "#70e0af", label="階段" if self.dungeon_number < 3 else "出口")
+        marker(self.px, self.py, "#ffffff", 4)
+        self.canvas.create_text(left, top+size+13, anchor="w", text="MAP  黒:未探索  点:発見した遺物", fill="#aeb5c4", font=("Yu Gothic UI", 8))
 
     # ------------------------------------------------------------------
     # Small shared helpers
@@ -2858,8 +2989,8 @@ class DarkRuins2D:
         self.root.update_idletasks()
         if len(self.player_sprites) != 12:
             raise RuntimeError(f"player sprite groups: {len(self.player_sprites)}, expected 12")
-        if len(self.enemy_sprites) != 3:
-            raise RuntimeError(f"enemy sprite sets: {len(self.enemy_sprites)}, expected 3")
+        if len(self.enemy_sprites) != 6:
+            raise RuntimeError(f"enemy sprite sets: {len(self.enemy_sprites)}, expected 6")
         if set(self.ally_sprites) != set(ALLY_STYLES):
             raise RuntimeError("one or more companion sprites failed to load")
         if self.ally_animations and set(self.ally_animations) != set(ALLY_STYLES):
@@ -2912,10 +3043,10 @@ def main() -> None:
                 return HEIGHT
 
             def width(self) -> int:
-                return 128
+                return 96
 
             def height(self) -> int:
-                return 128
+                return 96
 
             def transparency_get(self, *_args) -> bool:
                 return True

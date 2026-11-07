@@ -72,6 +72,12 @@ class Enemy:
     max_shield: int = 0
     revived_once: bool = False
     summoned: bool = False
+    behavior: str = "normal"
+    ability_cd: float = 0.0
+    charge_time: float = 0.0
+    charge_dx: float = 0.0
+    charge_dy: float = 0.0
+    guard_angle: float = 1.5707963267948966
 
     def __post_init__(self) -> None:
         if self.max_hp <= 0:

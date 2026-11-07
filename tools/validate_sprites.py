@@ -164,6 +164,15 @@ def main() -> int:
     errors = []
     errors += validate_player(ROOT / "assets" / "sprites" / "player" / "frames_v5")
     errors += validate_enemies(ROOT / "assets" / "sprites" / "enemies" / "frames_v6")
+    added = ROOT / "assets" / "sprites" / "enemies" / "frames_added_v1"
+    errors += validate_set(added, 96, 144)
+    for enemy_id in ("ash_charger", "ash_healer", "shield_knight"):
+        for direction in ("up", "down", "left", "right"):
+            for animation in ("idle", "walk", "attack"):
+                for index in range(1, 5):
+                    path = added / enemy_id / direction / animation / f"{index:02}.png"
+                    if not path.is_file():
+                        errors.append(f"Missing added enemy frame: {path}")
     errors += validate_set(ROOT / "assets" / "sprites" / "relics", 96, 9)
     errors += validate_set(ROOT / "assets" / "sprites" / "boss_projectiles", 48, 80)
     errors += validate_environment()
@@ -173,7 +182,7 @@ def main() -> int:
         for error in errors:
             print(f"- {error}")
         return 1
-    print("Sprite validation passed: 48 player frames, 144 enemy frames, UTF-8 sources OK.")
+    print("Sprite validation passed: 48 player frames, 288 enemy frames, UTF-8 sources OK.")
     return 0
 
 

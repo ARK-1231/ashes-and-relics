@@ -7,12 +7,14 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from dark_ruins_rpg import DarkRuins2D
+from game_options import GameOptions
 from game_models import PLAYER_ATTACK_COOLDOWN
 
 
 class InputResponseTests(unittest.TestCase):
     def setUp(self):
         self.game = DarkRuins2D.__new__(DarkRuins2D)
+        self.game.options = GameOptions()
         self.game.ui_mode = "playing"
         self.game.game_over = False
         self.game.keys = set()

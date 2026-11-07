@@ -14,7 +14,7 @@ class BossProgressionTests(unittest.TestCase):
         game.px = game.py = 0
         game.relics = []
         game._random_open_position = lambda *args, **kwargs: (100, 100)
-        for tier, hp, damage in ((1, 240, 22), (2, 420, 31), (3, 600, 40)):
+        for tier, hp, damage in ((1, 240, 22), (2, 480, 34), (3, 720, 46)):
             with self.subTest(tier=tier):
                 game.dungeon_number = tier
                 boss = next(enemy for enemy in game._make_enemies() if enemy.boss)
