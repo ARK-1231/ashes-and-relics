@@ -57,6 +57,112 @@ class InputResponseTests(unittest.TestCase):
         game._update_player_movement.assert_called_once()
         self.assertEqual(game.attack_cd, PLAYER_ATTACK_COOLDOWN)
 
+    def test_slow_frame_consumes_all_elapsed_time_in_safe_steps(self):
+        game = self.game
+        game.last_time = 1.0
+        game.hit_stop_time = 0
+        game.root = Mock()
+        game._update = Mock()
+        game._update_effects = Mock()
+        game._draw = Mock()
+        with patch("dark_ruins_rpg.time.perf_counter", return_value=1.12):
+            game._loop()
+        durations = [call.args[0] for call in game._update.call_args_list]
+        self.assertAlmostEqual(sum(durations), 0.12)
+        self.assertTrue(all(0 < dt <= 0.025 for dt in durations))
+        game._draw.assert_called_once()
+
+    def test_slow_frame_advances_attack_cooldown_in_real_time(self):
+        game = self.game
+        game.last_time = 1.0
+        game.hit_stop_time = 0.5
+        game.attack_cd = 0.5
+        game.root = Mock()
+        game._update_boss_gate = Mock()
+        game._update_effects = Mock()
+        game._draw = Mock()
+        with patch("dark_ruins_rpg.time.perf_counter", return_value=1.12):
+            game._loop()
+        self.assertAlmostEqual(game.attack_cd, 0.38)
+
+    def test_resume_after_sleep_pauses_without_catch_up(self):
+        game = self.game
+        game.last_time = 1.0
+        game.hit_stop_time = 0
+        game.keys = {"d", "f"}
+        game.attack_input_until = game.dodge_input_until = 1000
+        game.root = Mock()
+        game._update = Mock()
+        game._update_effects = Mock()
+        game._draw = Mock()
+        with patch("dark_ruins_rpg.time.perf_counter", return_value=601.0):
+            game._loop()
+        game._update.assert_not_called()
+        self.assertEqual(game.ui_mode, "paused")
+        self.assertEqual(game.keys, set())
+        self.assertEqual(game.attack_input_until, 0)
+        self.assertEqual(game.dodge_input_until, 0)
+        self.assertEqual(game.last_time, 601)
+        game._update_effects.assert_called_once_with(0)
+        game.root.after.assert_called_once()
+
+    def test_quick_attack_during_cooldown_is_buffered_once(self):
+        for trigger in ("click", "f"):
+            with self.subTest(trigger=trigger):
+                self.setUp()
+                game = self.game
+                game.attack_cd = 0.04
+                with patch("dark_ruins_rpg.time.perf_counter", return_value=10):
+                    if trigger == "click":
+                        game._aim_with_mouse = Mock()
+                        game._mouse_attack(SimpleNamespace(x=0, y=0))
+                    else:
+                        game._key_down(SimpleNamespace(keysym="f"))
+                        game._key_up(SimpleNamespace(keysym="f"))
+                    game._update_player_input(0.05)
+                    self.assertEqual(game._play_sound.call_count, 1)
+                    game._update_player_input(PLAYER_ATTACK_COOLDOWN)
+                    self.assertEqual(game._play_sound.call_count, 1)
+
+    def test_old_attack_input_expires(self):
+        game = self.game
+        game.attack_cd = 0.5
+        with patch("dark_ruins_rpg.time.perf_counter", return_value=10):
+            game._attack()
+        with patch("dark_ruins_rpg.time.perf_counter", return_value=10.2):
+            game._update_player_input(0.5)
+        game._play_sound.assert_not_called()
+
+    def test_short_dodge_tap_survives_key_release(self):
+        game = self.game
+        game._update_player_movement = DarkRuins2D._update_player_movement.__get__(game)
+        game.dodge_time = game.dodge_cd = 0
+        game.px = game.py = 1000
+        game.canvas = Mock()
+        game.canvas.winfo_width.return_value = 1280
+        game.canvas.winfo_height.return_value = 720
+        game.canvas.winfo_pointerx.return_value = 900
+        game.canvas.winfo_pointery.return_value = 360
+        game.canvas.winfo_rootx.return_value = 0
+        game.canvas.winfo_rooty.return_value = 0
+        game._move_player = Mock()
+        with patch("dark_ruins_rpg.time.perf_counter", return_value=10):
+            game._key_down(SimpleNamespace(keysym="space"))
+            game._key_up(SimpleNamespace(keysym="space"))
+            game._update_player_input(1 / 60)
+        self.assertGreater(game.dodge_time, 0)
+        game._move_player.assert_called_once()
+        self.assertEqual(game.dodge_input_until, 0)
+
+    def test_focus_loss_clears_buffered_actions(self):
+        game = self.game
+        game.keys = {"f", "space"}
+        game.attack_input_until = game.dodge_input_until = 10
+        game._clear_input()
+        self.assertEqual(game.keys, set())
+        self.assertEqual(game.attack_input_until, 0)
+        self.assertEqual(game.dodge_input_until, 0)
+
     def test_attack_hits_all_enemies_inside_sector_but_not_through_walls(self):
         game = self.game
         game.px = game.py = 0

@@ -16,13 +16,14 @@ class ProjectileInvincibilityTests(unittest.TestCase):
         game.hp = 100
         game.player_shield = 0
         game.dodge_time = game.hurt_invincible = game.hit_stop_time = 0
+        game.dodge_cd = 0
         game.has_ally = False
         game.allies = set()
         game.armor_bonus = 0
         game.skill = "blade"
         game._inside_boss_arena = Mock(return_value=True)
         game._line_blocked = Mock(return_value=False)
-        for name in ("_start_screen_shake", "_play_sound", "_knockback_player", "_say"):
+        for name in ("_start_screen_shake", "_play_sound", "_knockback_player", "_say", "_spawn_visual_effect"):
             setattr(game, name, Mock())
         game.projectiles = [
             Projectile(0, 0, 0, 0, 10, boss_attack=True, style=style)

@@ -1,4 +1,5 @@
 from __future__ import annotations
+from contextlib import contextmanager
 import math
 import random
 import sys
@@ -78,6 +79,15 @@ ALLY_SHIELD_PER_EXTRA_ALLY = 5
 ALLY_SHIELD_COOLDOWN = 12.0
 
 PLAYER_ATTACK_HALF_ANGLE = math.pi / 3
+INPUT_BUFFER_SECONDS = 0.15
+MINIMAP_INTERVAL = 0.1
+MAX_PARTICLES = 160
+MAX_LIGHT_RINGS = 24
+MAX_CATCH_UP_SECONDS = 1.0
+PERFECT_DODGE_WINDOW = 0.12
+PERFECT_DODGE_REFUND = 3.0
+PERFECT_DODGE_BOOST_DURATION = 3.0
+ALLY_COMMANDS = {"follow": "追従", "attack": "攻撃", "guard": "護衛"}
 
 # One condition is rolled from the stage seed whenever a new ruin is created.
 # Keeping the data in one place makes both combat tuning and HUD copy agree.
@@ -115,11 +125,73 @@ class FrameCanvas(tk.Canvas):
         super().__init__(*args, **kwargs)
         self._frame_items = []
         self._frame_cursor = 0
+        self._background_items = []
+        self._background_key = None
+        self._drawing_background = False
+        self._groups = {}
+        self._active_groups = set()
+        self._draw_order = []
+        self._previous_order = []
+        self._in_group = False
+
+    @contextmanager
+    def group(self, key, reuse=False):
+        """Retain an entity's items even when other entities appear/disappear."""
+        self._active_groups.add(key)
+        items = self._groups.setdefault(key, [])
+        if reuse and items:
+            self._draw_order.extend(item[1] for item in items)
+            yield False
+            return
+        saved = self._frame_items, self._frame_cursor, self._in_group
+        self._frame_items, self._frame_cursor, self._in_group = items, 0, True
+        try:
+            yield True
+            self.end_frame()
+        finally:
+            self._frame_items, self._frame_cursor, self._in_group = saved
+
+    def _record_item(self, item):
+        if not self._drawing_background:
+            self._draw_order.append(item)
+        return item
+
+    def draw_background(self, key, draw):
+        """Keep terrain independent of the variable number of actors and effects."""
+        if key == self._background_key:
+            return
+        foreground, cursor = self._frame_items, self._frame_cursor
+        self._frame_items = self._background_items
+        self._frame_cursor = 0
+        self._drawing_background = True
+        try:
+            draw()
+            self.end_frame()
+            self._background_items = self._frame_items
+            for _, item, _, _ in reversed(self._background_items):
+                self.tag_lower(item)
+            self._background_key = key
+        finally:
+            self._frame_items, self._frame_cursor = foreground, cursor
+            self._drawing_background = False
+
+    def hide_background(self):
+        if self._background_key is not None:
+            for _, item, _, _ in self._background_items:
+                self.itemconfigure(item, state="hidden")
+            # Hidden options must be restored on the next terrain draw.
+            for index, (kind, item, args, kw) in enumerate(self._background_items):
+                self._background_items[index] = (kind, item, args, {**kw, "state": "hidden"})
+            self._background_key = None
 
     def begin_frame(self):
         self._frame_cursor = 0
+        self._active_groups.clear()
+        self._draw_order = []
 
     def _create(self, itemType, args, kw):
+        if self._drawing_background:
+            kw["state"] = "normal"
         index = self._frame_cursor
         self._frame_cursor += 1
         if index < len(self._frame_items):
@@ -134,10 +206,10 @@ class FrameCanvas(tk.Canvas):
                     else:
                         self.itemconfigure(item, **kw)
                         self._frame_items[index] = (kind, item, args, dict(kw))
-                        return item
+                        return self._record_item(item)
                 else:
                     self._frame_items[index] = (kind, item, args, dict(kw))
-                    return item
+                    return self._record_item(item)
             else:
                 self.delete(item)
         item = super()._create(itemType, args, kw)
@@ -146,15 +218,34 @@ class FrameCanvas(tk.Canvas):
             if index:
                 self.tag_raise(item, self._frame_items[index - 1][1])
             else:
-                self.tag_lower(item)
+                if self._background_items and not self._drawing_background:
+                    self.tag_raise(item, self._background_items[-1][1])
+                else:
+                    self.tag_lower(item)
         else:
             self._frame_items.append((itemType, item, args, dict(kw)))
-        return item
+        return self._record_item(item)
 
     def end_frame(self):
         for _, item, _, _ in self._frame_items[self._frame_cursor:]:
             self.delete(item)
         del self._frame_items[self._frame_cursor:]
+        if self._drawing_background or self._in_group:
+            return
+        for key in self._groups.keys() - self._active_groups:
+            for _, item, _, _ in self._groups.pop(key):
+                self.delete(item)
+        # Reorder only after the scene structure changed. Normal coordinate or
+        # sprite updates preserve stacking and need no Tcl stacking calls.
+        if self._draw_order != self._previous_order:
+            prefix = 0
+            for old, new in zip(self._previous_order, self._draw_order):
+                if old != new:
+                    break
+                prefix += 1
+            for item in self._draw_order[prefix:]:
+                self.tag_raise(item)
+            self._previous_order = list(self._draw_order)
 
 
 class DarkRuins2D:
@@ -193,7 +284,7 @@ class DarkRuins2D:
 
         self.root.bind("<KeyPress>", self._key_down)
         self.root.bind("<KeyRelease>", self._key_up)
-        self.root.bind("<FocusOut>", lambda event: self.keys.clear())
+        self.root.bind("<FocusOut>", lambda event: self._clear_input())
         self.canvas.bind("<Motion>", self._aim_with_mouse)
         self.canvas.bind("<Button-1>", self._mouse_attack)
         self.root.protocol("WM_DELETE_WINDOW", self.root.destroy)
@@ -223,11 +314,24 @@ class DarkRuins2D:
         root = Path(__file__).resolve().parent.parent / "assets" / "environment"
         try:
             return {
-                "floor": tk.PhotoImage(file=str(root / "floor_tile.png")),
-                "wall": tk.PhotoImage(file=str(root / "wall_tile.png")),
+                name: self._opaque_texture(
+                    tk.PhotoImage(file=str(root / filename)), background,
+                )
+                for name, filename, background in (
+                    ("floor", "floor_tile.png", "#303541"),
+                    ("wall", "wall_tile.png", "#626978"),
+                )
             }
         except (tk.TclError, OSError):
             return {}
+
+    @staticmethod
+    def _opaque_texture(source: tk.PhotoImage, background: str) -> tk.PhotoImage:
+        """Flatten terrain alpha once, rather than blend it on every repaint."""
+        flat = tk.PhotoImage(master=source.tk, width=source.width(), height=source.height())
+        flat.put(background, to=(0, 0, source.width(), source.height()))
+        flat.tk.call(flat, "copy", source, "-compositingrule", "overlay")
+        return tk.PhotoImage(master=source.tk, data=flat.data(format="ppm"), format="ppm")
 
     @staticmethod
     def _build_tiled_image(
@@ -554,11 +658,19 @@ class DarkRuins2D:
                 "armor_bonus": self.armor_bonus,
                 "truth": self.truth,
                 "allies": set(self.allies),
+                "ally_command": self.ally_command,
                 "dungeon_number": getattr(self, "dungeon_number", 1) + 1,
                 "stage_events": tuple(getattr(self, "stage_events", (self.stage_event,))),
             }
         self.dungeon_number = progress["dungeon_number"] if progress else 1
         self.keys: set[str] = set()
+        self.attack_input_until = self.dodge_input_until = 0.0
+        self.ally_command = progress["ally_command"] if progress else "follow"
+        self.perfect_dodge_awarded = False
+        self.perfect_dodge_boost = 0.0
+        self._swing_multiplier = 1.0
+        self._minimap_key = None
+        self._minimap_next_update = 0.0
         self.px, self.py = stage(960), stage(1840)
         self.exploration = Exploration()
         self.facing = (0.0, -1.0)
@@ -952,7 +1064,7 @@ class DarkRuins2D:
         if key in {"p", "escape"} and not self.game_over:
             self.ui_mode = "paused"
             self.menu_index = 0
-            self.keys.clear()
+            self._clear_input()
             return
         if self.game_over and key in {"r", "n"}:
             self._restart(new_stage=key == "n")
@@ -961,7 +1073,16 @@ class DarkRuins2D:
             names = tuple(WEAPONS)
             self.weapon = names[(names.index(self.weapon) + 1) % len(names)]
             self._say(f"武器を{self._weapon_stats()[0]}に切り替えた。")
+        if key == "c" and key not in self.keys and not self.game_over:
+            commands = tuple(ALLY_COMMANDS)
+            self.ally_command = commands[(commands.index(self.ally_command) + 1) % len(commands)]
+            for companion in self.companions.values():
+                companion.path.clear()
+                companion.path_timer = 0.0
+            self._say(f"仲間への指示：{ALLY_COMMANDS[self.ally_command]}")
         self.keys.add(key)
+        if key == "space":
+            self.dodge_input_until = time.perf_counter() + INPUT_BUFFER_SECONDS
         if key in {"f", "return"}:
             self._attack()
         elif key in {"1", "2", "3", "4", "5", "6", "7", "8", "9"}:
@@ -1046,8 +1167,7 @@ class DarkRuins2D:
                 enemy.x, enemy.y = nx, ny
                 enemy.moving = True
                 if self._distance(self.px, self.py, nx, ny) <= enemy.radius+PLAYER_RADIUS:
-                    if not self.dodge_time:
-                        self._damage_player(enemy.damage+6, "突撃を受けた！", nx, ny)
+                    self._damage_player(enemy.damage+6, "突撃を受けた！", nx, ny)
                     enemy.charge_time = 0
                     break
             enemy.walk_time += duration
@@ -1100,7 +1220,7 @@ class DarkRuins2D:
     def _open_settings(self):
         previous_mode = self.ui_mode
         self.ui_mode = "settings"
-        self.keys.clear()
+        self._clear_input()
         dialog = tk.Toplevel(self.root)
         dialog.title("設定")
         dialog.transient(self.root)
@@ -1115,7 +1235,7 @@ class DarkRuins2D:
         tk.Checkbutton(dialog, text="画面揺れを有効にする", variable=shake).pack()
         tk.Label(dialog, text="キー割り当て：欄を選んでキーを押す\n移動はWASD／矢印キー、F2は設定専用").pack(pady=8)
         entries = {}
-        for action, label in (("f", "攻撃"), ("space", "回避"), ("e", "調べる"), ("q", "武器切替")):
+        for action, label in (("f", "攻撃"), ("space", "回避"), ("e", "調べる"), ("q", "武器切替"), ("c", "仲間の指示")):
             row = tk.Frame(dialog)
             row.pack(pady=3)
             tk.Label(row, text=label, width=12).pack(side="left")
@@ -1127,7 +1247,7 @@ class DarkRuins2D:
 
         def close():
             self.ui_mode = previous_mode
-            self.keys.clear()
+            self._clear_input()
             self.last_time = time.perf_counter()
             dialog.destroy()
 
@@ -1180,6 +1300,10 @@ class DarkRuins2D:
     def _key_up(self, event: tk.Event) -> None:
         key = event.keysym.lower()
         self.keys.discard(self.options.bindings.get(key, key))
+
+    def _clear_input(self) -> None:
+        self.keys.clear()
+        self.attack_input_until = self.dodge_input_until = 0.0
 
     def _aim_with_mouse(self, event: tk.Event) -> None:
         """Turn the player toward the mouse cursor."""
@@ -1242,16 +1366,32 @@ class DarkRuins2D:
 
     def _loop(self) -> None:
         now = time.perf_counter()
-        dt = min(now - self.last_time, 0.05)
+        dt = max(0.0, now - self.last_time)
         self.last_time = now
-        if self.hit_stop_time > 0:
-            self.hit_stop_time = max(0.0, self.hit_stop_time - dt)
+        if dt > MAX_CATCH_UP_SECONDS:
+            # Treat sleep, a debugger stop, or a long window drag as a pause.
+            # Never simulate minutes of combat before accepting the next input.
+            dt = 0.0
+            self._clear_input()
             if self.ui_mode == "playing" and not self.game_over:
-                self._update_player_input(dt)
-                self._update_boss_gate()
-        elif self.ui_mode == "playing" and not self.game_over:
-            self._update(dt)
-        self._update_effects(dt)
+                self.ui_mode = "paused"
+                self.menu_index = 0
+        # Consume elapsed time instead of dropping it on slow frames. Small
+        # steps keep a dodge from jumping over a wall during catch-up.
+        steps = max(1, math.ceil(dt / 0.025))
+        step = dt / steps
+        for _ in range(steps):
+            if self.hit_stop_time > 0:
+                self.hit_stop_time = max(0.0, self.hit_stop_time - step)
+                if self.ui_mode == "playing" and not self.game_over:
+                    self._update_player_input(step)
+                    self._update_boss_gate()
+            elif self.ui_mode == "playing" and not self.game_over:
+                generation = getattr(self, "stage_seed", None)
+                self._update(step)
+                if generation != getattr(self, "stage_seed", None):
+                    break
+            self._update_effects(step)
         self._draw()
         elapsed = time.perf_counter() - now
         self.root.after(max(1, math.ceil((1 / 60 - elapsed) * 1000)), self._loop)
@@ -1289,8 +1429,10 @@ class DarkRuins2D:
         self.ally_shield_cd = max(0.0, self.ally_shield_cd - dt)
         self.attack_cd = max(0.0, self.attack_cd - dt)
         self.attack_flash = max(0.0, self.attack_flash - dt)
+        self.perfect_dodge_boost = max(0.0, getattr(self, "perfect_dodge_boost", 0.0) - dt)
         self._update_player_movement(dt)
-        if self.keys.intersection({"f", "return"}) and self.attack_cd == 0:
+        buffered_attack = getattr(self, "attack_input_until", 0.0) > time.perf_counter()
+        if (self.keys.intersection({"f", "return"}) or buffered_attack) and self.attack_cd == 0:
             self._attack()
 
     def _update_player_movement(self, dt: float) -> None:
@@ -1303,7 +1445,9 @@ class DarkRuins2D:
             length = math.hypot(dx, dy)
             dx, dy = dx / length, dy / length
             self.facing = (dx, dy)
-        if "space" in self.keys and self.dodge_cd == 0:
+        buffered_dodge = getattr(self, "dodge_input_until", 0.0) > time.perf_counter()
+        if ("space" in self.keys or buffered_dodge) and self.dodge_cd == 0:
+            self.dodge_input_until = 0.0
             width, height = self.canvas.winfo_width(), self.canvas.winfo_height()
             cam_x = min(max(self.px - width / 2, 0), WORLD_SIZE - width)
             cam_y = min(max(self.py - height / 2, 0), WORLD_SIZE - height)
@@ -1315,12 +1459,56 @@ class DarkRuins2D:
             )
             self.dodge_time = DODGE_DURATION
             self.dodge_cd = DODGE_COOLDOWN
+            self.perfect_dodge_awarded = False
+            if not getattr(self, "hurt_invincible", 0.0) and self._imminent_dodge_threat():
+                self._award_perfect_dodge()
         if self.dodge_time:
             dx, dy = self.dodge_direction
             self.facing = self.dodge_direction
         speed = DODGE_SPEED if self.dodge_time else PLAYER_SPEED
         if dx or dy:
             self._move_player(dx * speed * dt, dy * speed * dt)
+
+    def _imminent_dodge_threat(self) -> bool:
+        """Check attacks that would hit the current position within 120 ms."""
+        for enemy in self.enemies:
+            if (enemy.hp > 0 and enemy.pending_attack == "melee"
+                    and 0 < enemy.windup <= PERFECT_DODGE_WINDOW
+                    and self._distance(self.px, self.py, enemy.x, enemy.y)
+                    <= enemy.radius + (130 if enemy.boss else 55)
+                    and not self._line_blocked(enemy.x, enemy.y, self.px, self.py, 3)):
+                return True
+        threats = [(p.x, p.y, p.vx, p.vy, p.radius, p.life)
+                   for p in getattr(self, "projectiles", ())]
+        threats.extend((e.x, e.y, e.charge_dx * 480, e.charge_dy * 480,
+                        e.radius, e.charge_time)
+                       for e in self.enemies if e.hp > 0 and e.charge_time > 0)
+        for x, y, vx, vy, radius, life in threats:
+            dx, dy = x - self.px, y - self.py
+            speed_sq = vx * vx + vy * vy
+            if speed_sq == 0 or life <= 0:
+                continue
+            projection = dx * vx + dy * vy
+            overlap = dx * dx + dy * dy - (radius + PLAYER_RADIUS) ** 2
+            discriminant = projection * projection - speed_sq * overlap
+            if discriminant < 0:
+                continue
+            impact = max(0.0, (-projection - math.sqrt(discriminant)) / speed_sq)
+            if overlap > 0 and projection >= 0:
+                continue
+            if (impact <= min(PERFECT_DODGE_WINDOW, life)
+                    and not self._line_blocked(x, y, x + vx * impact, y + vy * impact, radius)):
+                return True
+        return False
+
+    def _award_perfect_dodge(self) -> None:
+        if getattr(self, "perfect_dodge_awarded", False):
+            return
+        self.perfect_dodge_awarded = True
+        self.dodge_cd = max(0.0, self.dodge_cd - PERFECT_DODGE_REFUND)
+        self.perfect_dodge_boost = PERFECT_DODGE_BOOST_DURATION
+        self._spawn_visual_effect(self.px, self.py, "#ffe18a", 12, 75, "#fff0bd", 0.06)
+        self._say("直前回避！ 回避待ち時間-3秒・3秒以内の次の攻撃が1.5倍！", 2.0)
 
     def _move_player(self, dx: float, dy: float) -> None:
         nx = self.px + dx
@@ -1451,9 +1639,28 @@ class DarkRuins2D:
         companions = [self.companions[name] for name in sorted(self.companions)]
         for index, companion in enumerate(companions):
             angle = math.tau * index / max(1, len(companions))
-            target_x = self.px + math.cos(angle) * ALLY_FOLLOW_DISTANCE
-            target_y = self.py + math.sin(angle) * ALLY_FOLLOW_DISTANCE
+            command = getattr(self, "ally_command", "follow")
+            distance = 32 if command == "guard" else ALLY_FOLLOW_DISTANCE
+            target_x = self.px + math.cos(angle) * distance
+            target_y = self.py + math.sin(angle) * distance
+            if command == "attack":
+                targets = self._companion_targets(companion, 520, from_player=True)
+                if targets:
+                    enemy = min(targets, key=lambda e: self._distance(companion.x, companion.y, e.x, e.y))
+                    spacing = {"ミラ": 170, "灰騎士レオン": 90, "星詠みノア": 260}.get(companion.name, 170)
+                    dx, dy = companion.x - enemy.x, companion.y - enemy.y
+                    length = max(1, math.hypot(dx, dy))
+                    target_x, target_y = enemy.x + dx / length * spacing, enemy.y + dy / length * spacing
             self._update_one_companion(companion, target_x, target_y, dt)
+
+    def _companion_targets(self, companion, attack_range, *, from_player=False):
+        command = getattr(self, "ally_command", "follow")
+        x, y = (self.px, self.py) if from_player else (companion.x, companion.y)
+        return [enemy for enemy in self.enemies
+                if enemy.hp > 0 and (not enemy.boss or self.door_open)
+                and self._distance(x, y, enemy.x, enemy.y) < attack_range
+                and (command != "guard" or self._distance(self.px, self.py, enemy.x, enemy.y) <= 200)
+                and not self._line_blocked(companion.x, companion.y, enemy.x, enemy.y, 4)]
 
     def _update_one_companion(
         self, companion: Companion, target_x: float, target_y: float, dt: float,
@@ -1526,7 +1733,10 @@ class DarkRuins2D:
         return ALLY_SHIELD_AMOUNT + ALLY_SHIELD_PER_EXTRA_ALLY * (len(self.allies) - 1)
 
     def _perform_companion_action(self, companion: Companion) -> None:
-        if companion.name == "ミラ" and self.hp <= self.max_hp * 0.55:
+        command = getattr(self, "ally_command", "follow")
+        can_support = (self._distance(companion.x, companion.y, self.px, self.py) <= 240
+                       and not self._line_blocked(companion.x, companion.y, self.px, self.py, 4))
+        if companion.name == "ミラ" and self.hp <= self.max_hp * 0.55 and can_support:
             healed = min(14, self.max_hp - self.hp)
             self.hp += healed
             companion.cooldown = companion.cooldown_max = 4.0
@@ -1537,6 +1747,8 @@ class DarkRuins2D:
             self._say(f"ミラの祈りでHPが{healed}回復した。")
             return
         if (
+            command != "attack"
+            and
             self.player_shield == 0 and self.ally_shield_cd == 0
             and self._distance(companion.x, companion.y, self.px, self.py) <= 240
             and not self._line_blocked(companion.x, companion.y, self.px, self.py, 4)
@@ -1553,16 +1765,14 @@ class DarkRuins2D:
         damages = {"ミラ": 8, "灰騎士レオン": 18, "星詠みノア": 13}
         cooldowns = {"ミラ": 2.0, "灰騎士レオン": 1.15, "星詠みノア": 2.35}
         attack_range = ranges.get(companion.name, 250)
-        targets = [
-            enemy for enemy in self.enemies
-            if self._distance(companion.x, companion.y, enemy.x, enemy.y) < attack_range
-            and not self._line_blocked(companion.x, companion.y, enemy.x, enemy.y, 4)
-        ]
+        targets = self._companion_targets(companion, attack_range)
         if not targets:
             return
         target = min(
             targets,
-            key=lambda enemy: self._distance(companion.x, companion.y, enemy.x, enemy.y),
+            key=lambda enemy: self._distance(
+                self.px if command == "guard" else companion.x,
+                self.py if command == "guard" else companion.y, enemy.x, enemy.y),
         )
         damage = damages.get(companion.name, 8)
         if companion.name == "ミラ" and self.skill == "lantern":
@@ -1832,7 +2042,6 @@ class DarkRuins2D:
             if (
                 self._distance(self.px, self.py, enemy.x, enemy.y) <= enemy.radius + melee_reach
                 and not self._line_blocked(enemy.x, enemy.y, self.px, self.py, 3)
-                and not self.dodge_time
             ):
                 self._damage_player(
                     enemy.damage, f"{enemy.name}の攻撃！", enemy.x, enemy.y,
@@ -1871,7 +2080,12 @@ class DarkRuins2D:
         *,
         invincibility_duration: float = 0.55,
     ) -> None:
-        if self.dodge_time or self.hurt_invincible > 0:
+        if self.dodge_time:
+            if (DODGE_DURATION - self.dodge_time <= PERFECT_DODGE_WINDOW
+                    and self.hurt_invincible <= 0):
+                self._award_perfect_dodge()
+            return
+        if self.hurt_invincible > 0:
             return
         guard = (
             (5 if self.has_ally else 0)
@@ -2091,7 +2305,8 @@ class DarkRuins2D:
         flash_color: str,
         flash_duration: float,
     ) -> None:
-        for _ in range(particle_count):
+        count = min(particle_count, max(0, MAX_PARTICLES - len(self.particles)))
+        for _ in range(count):
             angle = self.rng.random() * math.tau
             speed = self.rng.uniform(65, 210)
             life = self.rng.uniform(0.45, 0.9)
@@ -2104,6 +2319,8 @@ class DarkRuins2D:
                 life,
                 self.rng.uniform(2.5, 6.0),
             ))
+        if len(self.light_rings) >= MAX_LIGHT_RINGS:
+            del self.light_rings[0]
         self.light_rings.append(LightRing(
             x, y, color,
             life=0.65,
@@ -2139,7 +2356,9 @@ class DarkRuins2D:
         if self.game_over:
             return
         if self.attack_cd:
+            self.attack_input_until = time.perf_counter() + INPUT_BUFFER_SECONDS
             return
+        self.attack_input_until = 0.0
         self._aim_at_cursor()
         self.attack_direction = self.facing
         self.attack_cd = self._weapon_stats()[3]
@@ -2149,11 +2368,17 @@ class DarkRuins2D:
         candidates = [enemy for enemy in self.enemies if self._in_attack_sector(enemy)
                       and not self._line_blocked(self.px, self.py, enemy.x, enemy.y, 5)]
         if not candidates:
+            self.perfect_dodge_boost = 0.0
             self._play_sound("swing")
             self._say("剣は空を切った。")
             return
-        for enemy in candidates:
-            self._hit_enemy(enemy)
+        self._swing_multiplier = 1.5 if getattr(self, "perfect_dodge_boost", 0.0) > 0 else 1.0
+        self.perfect_dodge_boost = 0.0
+        try:
+            for enemy in candidates:
+                self._hit_enemy(enemy)
+        finally:
+            self._swing_multiplier = 1.0
         self._remove_dead()
 
     def _in_attack_sector(self, enemy: Enemy) -> bool:
@@ -2189,6 +2414,7 @@ class DarkRuins2D:
             damage += 8
         if "blood_price" in getattr(self, "stage_events", ()):
             damage = round(damage * 1.25)
+        damage = round(damage * getattr(self, "_swing_multiplier", 1.0))
         shield_damage, hp_damage = self._damage_enemy(enemy, damage)
         dx, dy = enemy.x - self.px, enemy.y - self.py
         hit_distance = max(1.0, math.hypot(dx, dy))
@@ -2302,29 +2528,25 @@ class DarkRuins2D:
 
     def _draw(self) -> None:
         self.canvas.begin_frame()
+        self._landmark_order = ([], [])
         try:
             self._draw_scene()
             self.canvas.create_text(self.canvas.winfo_width() - 20, self.canvas.winfo_height() - 18,
                                     anchor="e", text=f"F2: 設定  武器: {self._weapon_stats()[0]}",
                                     fill="white", font=("Yu Gothic", 11))
+            if self.ui_mode in {"playing", "paused"}:
+                boost = f"  直前回避強化 {self.perfect_dodge_boost:.1f}秒（次の攻撃×1.5）" if self.perfect_dodge_boost > 0 else ""
+                self.canvas.create_text(
+                    20, self.canvas.winfo_height() - 18, anchor="w",
+                    text=f"仲間 [C]：{ALLY_COMMANDS[self.ally_command]}{boost}",
+                    fill="#ffe18a" if boost else "#9de4ff", font=("Yu Gothic UI", 10, "bold"),
+                )
         finally:
             self.canvas.end_frame()
+            self._order_landmark_overlaps(*self._landmark_order)
 
-    def _draw_scene(self) -> None:
-        width, height = self.canvas.winfo_width(), self.canvas.winfo_height()
-        if self.ui_mode == "title":
-            self._draw_title_screen(width, height)
-            return
-        if self.ui_mode == "help":
-            self._draw_help_screen(width, height)
-            return
-        cam_x = min(max(self.px - width / 2, 0), WORLD_SIZE - width)
-        cam_y = min(max(self.py - height / 2, 0), WORLD_SIZE - height)
-        if self.screen_shake_time > 0 and self.options.shake:
-            cam_x += self.rng.uniform(-self.screen_shake_strength, self.screen_shake_strength)
-            cam_y += self.rng.uniform(-self.screen_shake_strength, self.screen_shake_strength)
+    def _draw_terrain(self, width, height, cam_x, cam_y):
         sx, sy = lambda x: x - cam_x, lambda y: y - cam_y
-
         self.canvas.create_rectangle(0, 0, width, height, fill="#303541", outline="")
         floor_texture = self.environment_textures.get("floor")
         if floor_texture is not None:
@@ -2354,6 +2576,30 @@ class DarkRuins2D:
                     fill="", outline="#929aaa", width=2,
                 )
 
+
+    def _draw_scene(self) -> None:
+        width, height = self.canvas.winfo_width(), self.canvas.winfo_height()
+        if self.ui_mode == "title":
+            self.canvas.hide_background()
+            self._draw_title_screen(width, height)
+            return
+        if self.ui_mode == "help":
+            self.canvas.hide_background()
+            self._draw_help_screen(width, height)
+            return
+        cam_x = min(max(self.px - width / 2, 0), WORLD_SIZE - width)
+        cam_y = min(max(self.py - height / 2, 0), WORLD_SIZE - height)
+        if self.screen_shake_time > 0 and self.options.shake:
+            cam_x += self.rng.uniform(-self.screen_shake_strength, self.screen_shake_strength)
+            cam_y += self.rng.uniform(-self.screen_shake_strength, self.screen_shake_strength)
+        sx, sy = lambda x: x - cam_x, lambda y: y - cam_y
+
+        terrain_key = (width, height, cam_x, cam_y, tuple(self.walls),
+                       tuple(self.environment_textures.items()))
+        self.canvas.draw_background(
+            terrain_key, lambda: self._draw_terrain(width, height, cam_x, cam_y),
+        )
+
         actor_sprites = []
         landmark_sprites = []
         landmark_x, landmark_y = sx(stage(960)), sy(stage(1660))
@@ -2373,45 +2619,47 @@ class DarkRuins2D:
             self.canvas.create_text(sx(stage(960)), sy(stage(650)), text=gate_label, fill="white")
 
         for projectile in self.projectiles:
-            x, y = sx(projectile.x), sy(projectile.y)
-            radius = projectile.radius
-            # Include the longest fallback shape and the 48px projectile sprites.
-            if not self._rect_in_view(x, y, 0, 0, width, height, max(24, radius * 2.2) + 3):
-                continue
-            projectile_sprite = self._boss_projectile_sprite(projectile)
-            if projectile_sprite is not None:
-                self.canvas.create_image(x, y, image=projectile_sprite)
-            elif projectile.style in {"lance", "wave"}:
-                angle = math.atan2(projectile.vy, projectile.vx)
-                ux, uy = math.cos(angle), math.sin(angle)
-                px, py = -uy, ux
-                length = radius * (2.2 if projectile.style == "lance" else 1.4)
-                self.canvas.create_polygon(
-                    x + ux * length, y + uy * length,
-                    x + px * radius, y + py * radius,
-                    x - ux * length, y - uy * length,
-                    x - px * radius, y - py * radius,
-                    fill=projectile.color, outline=projectile.outline, width=2,
-                )
-            else:
-                self.canvas.create_oval(
-                    x - radius, y - radius, x + radius, y + radius,
-                    fill=projectile.color, outline=projectile.outline,
-                    width=3 if projectile.style == "ring" else 2,
-                )
+            with self.canvas.group(("projectile", id(projectile))):
+                x, y = sx(projectile.x), sy(projectile.y)
+                radius = projectile.radius
+                # Include the longest fallback shape and the 48px projectile sprites.
+                if not self._rect_in_view(x, y, 0, 0, width, height, max(24, radius * 2.2) + 3):
+                    continue
+                projectile_sprite = self._boss_projectile_sprite(projectile)
+                if projectile_sprite is not None:
+                    self.canvas.create_image(x, y, image=projectile_sprite)
+                elif projectile.style in {"lance", "wave"}:
+                    angle = math.atan2(projectile.vy, projectile.vx)
+                    ux, uy = math.cos(angle), math.sin(angle)
+                    px, py = -uy, ux
+                    length = radius * (2.2 if projectile.style == "lance" else 1.4)
+                    self.canvas.create_polygon(
+                        x + ux * length, y + uy * length,
+                        x + px * radius, y + py * radius,
+                        x - ux * length, y - uy * length,
+                        x - px * radius, y - py * radius,
+                        fill=projectile.color, outline=projectile.outline, width=2,
+                    )
+                else:
+                    self.canvas.create_oval(
+                        x - radius, y - radius, x + radius, y + radius,
+                        fill=projectile.color, outline=projectile.outline,
+                        width=3 if projectile.style == "ring" else 2,
+                    )
 
         for bolt in self.ally_bolts:
-            x, y = sx(bolt.x), sy(bolt.y)
-            if not self._rect_in_view(x, y, 0, 0, width, height, 14):
-                continue
-            self.canvas.create_oval(
-                x - 7, y - 7, x + 7, y + 7,
-                fill="#70dfff", outline="#e0fbff", width=2,
-            )
-            self.canvas.create_oval(
-                x - 12, y - 12, x + 12, y + 12,
-                outline="#70dfff", width=1, dash=(3, 3),
-            )
+            with self.canvas.group(("bolt", id(bolt))):
+                x, y = sx(bolt.x), sy(bolt.y)
+                if not self._rect_in_view(x, y, 0, 0, width, height, 14):
+                    continue
+                self.canvas.create_oval(
+                    x - 7, y - 7, x + 7, y + 7,
+                    fill="#70dfff", outline="#e0fbff", width=2,
+                )
+                self.canvas.create_oval(
+                    x - 12, y - 12, x + 12, y + 12,
+                    outline="#70dfff", width=1, dash=(3, 3),
+                )
 
         for relic in self.relics:
             if not relic.collected and self._rect_in_view(
@@ -2431,7 +2679,10 @@ class DarkRuins2D:
                 x, y, text=f"復活 {revive_timer:.1f}",
                 fill="#b9ffd1", font=("Yu Gothic UI", 9, "bold"),
             )
-        if self.ally_candidate_name:
+        if self.ally_candidate_name and self._rect_in_view(
+            sx(self.ally_candidate_x), sy(self.ally_candidate_y), 0, 0,
+            width, height, 160,
+        ):
             color, _ = ALLY_STYLES.get(
                 self.ally_candidate_name, ("#e7b94c", self.ally_candidate_name),
             )
@@ -2451,102 +2702,109 @@ class DarkRuins2D:
                 300 if enemy.boss else 160,
             ):
                 continue
-            enemy_color = enemy.color
-            enemy_sprite = self._boss_sprite_for_attack(enemy) if enemy.boss else self._enemy_sprite(enemy)
-            if enemy_sprite is not None:
-                item = self.canvas.create_image(
-                    sx(enemy.x), sy(enemy.y) + (enemy.radius if enemy.boss else self._enemy_sprite_offset()),
-                    image=enemy_sprite, anchor="s",
-                )
-                actor_sprites.append((sx(enemy.x), sy(enemy.y), item))
-            else:
-                self._draw_actor(sx(enemy.x), sy(enemy.y), enemy.radius, enemy_color, enemy.name)
-            if enemy.behavior == "shield":
-                r = enemy.radius + 7
-                self.canvas.create_arc(sx(enemy.x)-r, sy(enemy.y)-r, sx(enemy.x)+r, sy(enemy.y)+r,
-                                       start=-math.degrees(enemy.guard_angle)-60, extent=120,
-                                       style="arc", outline="#a8dbff", width=6)
-            if (
-                enemy.boss
-                and "boss_command" in self.stage_events
-                and self.boss_gate_locked
-                and self.boss_summon_timer <= 2.0
-            ):
-                summon_radius = enemy.radius + 42 + (2.0 - self.boss_summon_timer) * 18
-                self.canvas.create_oval(
-                    sx(enemy.x) - summon_radius, sy(enemy.y) - summon_radius,
-                    sx(enemy.x) + summon_radius, sy(enemy.y) + summon_radius,
-                    outline="#f0a35b", width=4, dash=(7, 4),
-                )
-                self.canvas.create_text(
-                    sx(enemy.x), sy(enemy.y) - enemy.radius - 55,
-                    text=f"召喚 {self.boss_summon_timer:.1f}",
-                    fill="#ffd19a", font=("Yu Gothic UI", 10, "bold"),
-                )
-            bar = max(0, enemy.hp) / max(1, enemy.max_hp)
-            self.canvas.create_rectangle(sx(enemy.x) - 28, sy(enemy.y) - enemy.radius - 13, sx(enemy.x) + 28, sy(enemy.y) - enemy.radius - 8, fill="#351519", outline="")
-            self.canvas.create_rectangle(sx(enemy.x) - 28, sy(enemy.y) - enemy.radius - 13, sx(enemy.x) - 28 + 56 * bar, sy(enemy.y) - enemy.radius - 8, fill="#d14848", outline="")
-            if enemy.max_shield > 0:
-                shield_ratio = enemy.shield / enemy.max_shield
-                shield_top = sy(enemy.y) - enemy.radius - 21
-                self.canvas.create_rectangle(
-                    sx(enemy.x) - 28, shield_top,
-                    sx(enemy.x) + 28, shield_top + 5,
-                    fill="#16263a", outline="",
-                )
-                self.canvas.create_rectangle(
-                    sx(enemy.x) - 28, shield_top,
-                    sx(enemy.x) - 28 + 56 * shield_ratio, shield_top + 5,
-                    fill="#4ab8ed", outline="",
-                )
+            with self.canvas.group(("enemy", id(enemy))):
+                enemy_color = enemy.color
+                enemy_sprite = self._boss_sprite_for_attack(enemy) if enemy.boss else self._enemy_sprite(enemy)
+                if enemy_sprite is not None:
+                    item = self.canvas.create_image(
+                        sx(enemy.x), sy(enemy.y) + (enemy.radius if enemy.boss else self._enemy_sprite_offset()),
+                        image=enemy_sprite, anchor="s",
+                    )
+                    actor_sprites.append((sx(enemy.x), sy(enemy.y), item))
+                else:
+                    self._draw_actor(sx(enemy.x), sy(enemy.y), enemy.radius, enemy_color, enemy.name)
+                if enemy.behavior == "shield":
+                    r = enemy.radius + 7
+                    self.canvas.create_arc(sx(enemy.x)-r, sy(enemy.y)-r, sx(enemy.x)+r, sy(enemy.y)+r,
+                                           start=-math.degrees(enemy.guard_angle)-60, extent=120,
+                                           style="arc", outline="#a8dbff", width=6)
+                if (
+                    enemy.boss
+                    and "boss_command" in self.stage_events
+                    and self.boss_gate_locked
+                    and self.boss_summon_timer <= 2.0
+                ):
+                    summon_radius = enemy.radius + 42 + (2.0 - self.boss_summon_timer) * 18
+                    self.canvas.create_oval(
+                        sx(enemy.x) - summon_radius, sy(enemy.y) - summon_radius,
+                        sx(enemy.x) + summon_radius, sy(enemy.y) + summon_radius,
+                        outline="#f0a35b", width=4, dash=(7, 4),
+                    )
+                    self.canvas.create_text(
+                        sx(enemy.x), sy(enemy.y) - enemy.radius - 55,
+                        text=f"召喚 {self.boss_summon_timer:.1f}",
+                        fill="#ffd19a", font=("Yu Gothic UI", 10, "bold"),
+                    )
+                bar = max(0, enemy.hp) / max(1, enemy.max_hp)
+                self.canvas.create_rectangle(sx(enemy.x) - 28, sy(enemy.y) - enemy.radius - 13, sx(enemy.x) + 28, sy(enemy.y) - enemy.radius - 8, fill="#351519", outline="")
+                self.canvas.create_rectangle(sx(enemy.x) - 28, sy(enemy.y) - enemy.radius - 13, sx(enemy.x) - 28 + 56 * bar, sy(enemy.y) - enemy.radius - 8, fill="#d14848", outline="")
+                if enemy.max_shield > 0:
+                    shield_ratio = enemy.shield / enemy.max_shield
+                    shield_top = sy(enemy.y) - enemy.radius - 21
+                    self.canvas.create_rectangle(
+                        sx(enemy.x) - 28, shield_top,
+                        sx(enemy.x) + 28, shield_top + 5,
+                        fill="#16263a", outline="",
+                    )
+                    self.canvas.create_rectangle(
+                        sx(enemy.x) - 28, shield_top,
+                        sx(enemy.x) - 28 + 56 * shield_ratio, shield_top + 5,
+                        fill="#4ab8ed", outline="",
+                    )
         if self.has_ally:
             for ally_name in sorted(self.companions):
                 companion = self.companions[ally_name]
-                color, label = ALLY_STYLES.get(ally_name, ("#e7b94c", ally_name))
-                item = self._draw_ally(ally_name, sx(companion.x), sy(companion.y), companion)
-                actor_sprites.append((sx(companion.x), sy(companion.y), item))
-                cooldown_ratio = (
-                    companion.cooldown / companion.cooldown_max
-                    if companion.cooldown_max > 0 else 0.0
-                )
-                bar_left = sx(companion.x) - 22
-                bar_top = sy(companion.y) - 70
-                self.canvas.create_rectangle(
-                    bar_left, bar_top, bar_left + 44, bar_top + 5,
-                    fill="#252735", outline="#e7d58a",
-                )
-                self.canvas.create_rectangle(
-                    bar_left, bar_top,
-                    bar_left + 44 * (1.0 - cooldown_ratio), bar_top + 5,
-                    fill="#70dfff", outline="",
-                )
+                if not self._rect_in_view(
+                    sx(companion.x), sy(companion.y), 0, 0, width, height, 160,
+                ):
+                    continue
+                with self.canvas.group(("ally", ally_name)):
+                    color, label = ALLY_STYLES.get(ally_name, ("#e7b94c", ally_name))
+                    item = self._draw_ally(ally_name, sx(companion.x), sy(companion.y), companion)
+                    actor_sprites.append((sx(companion.x), sy(companion.y), item))
+                    cooldown_ratio = (
+                        companion.cooldown / companion.cooldown_max
+                        if companion.cooldown_max > 0 else 0.0
+                    )
+                    bar_left = sx(companion.x) - 22
+                    bar_top = sy(companion.y) - 70
+                    self.canvas.create_rectangle(
+                        bar_left, bar_top, bar_left + 44, bar_top + 5,
+                        fill="#252735", outline="#e7d58a",
+                    )
+                    self.canvas.create_rectangle(
+                        bar_left, bar_top,
+                        bar_left + 44 * (1.0 - cooldown_ratio), bar_top + 5,
+                        fill="#70dfff", outline="",
+                    )
 
-        player_color = "#74a7e8" if not self.dodge_time else "#d7efff"
-        player_visible = (
-            self.hurt_invincible <= 0
-            or int(self.hurt_invincible * 24) % 2 == 0
-        )
-        player_x, player_y = sx(self.px), sy(self.py)
-        # Keep identity markers visible while the hurt sprite blinks.
-        self.canvas.create_oval(
-            player_x - 28, player_y + 1, player_x + 28, player_y + 23,
-            fill="#142d3b", outline="#63e6ff", width=3,
-        )
-        self.canvas.create_oval(
-            player_x - 22, player_y + 5, player_x + 22, player_y + 19,
-            outline="#e5fbff", width=1,
-        )
-        if player_visible:
-            player_sprite = self._player_sprite()
-            if player_sprite is not None:
-                item = self.canvas.create_image(
-                    sx(self.px), sy(self.py) + self._player_sprite_offset(),
-                    image=player_sprite, anchor="s",
-                )
-                actor_sprites.append((player_x, player_y, item))
-            else:
-                self._draw_actor(sx(self.px), sy(self.py), PLAYER_RADIUS, player_color, "")
-        self._order_landmark_overlaps(landmark_sprites, actor_sprites)
+        with self.canvas.group("player"):
+            player_color = "#74a7e8" if not self.dodge_time else "#d7efff"
+            player_visible = (
+                self.hurt_invincible <= 0
+                or int(self.hurt_invincible * 24) % 2 == 0
+            )
+            player_x, player_y = sx(self.px), sy(self.py)
+            # Keep identity markers visible while the hurt sprite blinks.
+            self.canvas.create_oval(
+                player_x - 28, player_y + 1, player_x + 28, player_y + 23,
+                fill="#142d3b", outline="#63e6ff", width=3,
+            )
+            self.canvas.create_oval(
+                player_x - 22, player_y + 5, player_x + 22, player_y + 19,
+                outline="#e5fbff", width=1,
+            )
+            if player_visible:
+                player_sprite = self._player_sprite()
+                if player_sprite is not None:
+                    item = self.canvas.create_image(
+                        sx(self.px), sy(self.py) + self._player_sprite_offset(),
+                        image=player_sprite, anchor="s",
+                    )
+                    actor_sprites.append((player_x, player_y, item))
+                else:
+                    self._draw_actor(sx(self.px), sy(self.py), PLAYER_RADIUS, player_color, "")
+        self._landmark_order = (landmark_sprites, actor_sprites)
         fx, fy = self.attack_direction if self.attack_flash > 0 else self.facing
         if not self.player_sprites:
             self.canvas.create_line(sx(self.px), sy(self.py), sx(self.px + fx * 42), sy(self.py + fy * 42), fill="#e8edf4", width=5)
@@ -2668,6 +2926,9 @@ class DarkRuins2D:
             "向き　　　　マウスを動かした方向へ向く\n"
             "攻撃　　　　左クリック / F / Enter（カーソル方向へ攻撃）\n"
             "回避　　　　Space（カーソル方向へ回避し、短時間無敵）\n"
+            "直前回避　　命中直前0.12秒に回避：待ち時間-3秒\n"
+            "　　　　　　3秒以内の次の攻撃が1.5倍（空振りでも消費）\n"
+            "仲間の指示　C：追従 → 攻撃 → 護衛\n"
             "調べる　　　E（祠や隠された碑文の近くで使用）\n"
             "遺物切替　　1：灰刃　2：灯火　3：黒心\n"
             "　　　　　　4：聖杯　5：籠手　6：翼章\n"
@@ -2677,15 +2938,16 @@ class DarkRuins2D:
             "遺物を集めて封印を解き、仲間のミラと守護者を倒す。\n"
             "守護者を倒した後、部屋上側の出口へ向かう。\n"
             "遺物・仲間・碑文で真相度を集めると結末が変化する。\n"
-            "ミラは自動で支援弾を撃ち、HP低下時には回復してくれる。"
+            "追従：近くで支援 ／ 攻撃：敵に接近して攻撃優先\n"
+            "護衛：近くを守り、プレイヤーに近い敵を優先。"
         )
         self.canvas.create_rectangle(
             width / 2 - 330, 120, width / 2 + 330, height - 100,
             fill="#111722", outline="#5c6170", width=2,
         )
         self.canvas.create_text(
-            width / 2, 160, anchor="n", text=controls,
-            fill="#d7dce7", font=("Yu Gothic UI", 12),
+            width / 2, 130 if height < 650 else 150, anchor="n", text=controls,
+            fill="#d7dce7", font=("Yu Gothic UI", 9 if height < 650 else 11),
             justify="left",
         )
         self.canvas.create_text(
@@ -2787,6 +3049,8 @@ class DarkRuins2D:
             radius = ring.start_radius + (ring.end_radius - ring.start_radius) * progress
             line_width = max(1, round(5 * (1.0 - progress)))
             x, y = sx(ring.x), sy(ring.y)
+            if not self._rect_in_view(x, y, 0, 0, width, height, radius + line_width):
+                continue
             self.canvas.create_oval(
                 x - radius, y - radius, x + radius, y + radius,
                 outline=ring.color, width=line_width,
@@ -2802,6 +3066,8 @@ class DarkRuins2D:
             life_ratio = particle.life / particle.max_life
             size = max(1.0, particle.size * life_ratio)
             x, y = sx(particle.x), sy(particle.y)
+            if not self._rect_in_view(x, y, 0, 0, width, height, size):
+                continue
             stipple = "" if life_ratio > 0.55 else "gray50"
             self.canvas.create_oval(
                 x - size, y - size, x + size, y + size,
@@ -2917,6 +3183,17 @@ class DarkRuins2D:
         self.canvas.create_rectangle(inner_right, inner_top, outer_right, inner_bottom, **soft)
 
     def _draw_minimap(self, width: int, height: int) -> None:
+        now = time.perf_counter()
+        key = (width, height, id(self.exploration), "fog" in self.stage_events,
+               self.door_open, self.boss_gate_locked)
+        reuse = (key == self._minimap_key and now < self._minimap_next_update)
+        with self.canvas.group("minimap", reuse=reuse) as redraw:
+            if redraw:
+                self._draw_minimap_contents(width, height)
+                self._minimap_key = key
+                self._minimap_next_update = now + MINIMAP_INTERVAL
+
+    def _draw_minimap_contents(self, width: int, height: int) -> None:
         size = min(210, max(150, height - 120))
         left, top = width - size - 18, 52
         scale = size / WORLD_SIZE

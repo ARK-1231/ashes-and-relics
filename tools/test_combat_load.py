@@ -5,11 +5,12 @@ import math
 import random
 import sys
 import unittest
+from unittest.mock import Mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from dark_ruins_rpg import DarkRuins2D
-from game_models import Enemy, Projectile
+from dark_ruins_rpg import DarkRuins2D, MAX_PARTICLES, MAX_LIGHT_RINGS
+from game_models import Enemy, Projectile, Particle, LightRing
 
 
 def separate_reference(game):
@@ -37,6 +38,32 @@ def separate_reference(game):
 
 
 class CombatLoadTests(unittest.TestCase):
+    def test_repeated_combat_effects_have_bounded_storage(self):
+        game = DarkRuins2D.__new__(DarkRuins2D)
+        game.rng = random.Random(5)
+        game.particles = []
+        game.light_rings = []
+        game.screen_flash_time = 0
+        for _ in range(100):
+            game._spawn_visual_effect(10, 10, "red", 24, 40, "white", .1)
+        self.assertEqual(len(game.particles), MAX_PARTICLES)
+        self.assertEqual(len(game.light_rings), MAX_LIGHT_RINGS)
+        game.screen_shake_time = game.screen_shake_strength = 0
+        game._update_effects(1)
+        self.assertEqual(game.particles, [])
+        self.assertEqual(game.light_rings, [])
+
+    def test_offscreen_effects_are_culled_but_visible_edges_are_drawn(self):
+        game = DarkRuins2D.__new__(DarkRuins2D)
+        game.canvas = Mock()
+        game.screen_flash_time = 0
+        game.particles = [Particle(-100, -100, 0, 0, "red", 1, 1, 5),
+                          Particle(-2, 50, 0, 0, "red", 1, 1, 5)]
+        game.light_rings = [LightRing(500, 500, "red", .2, 1, 10, 40),
+                            LightRing(-5, 50, "red", .2, 1, 10, 40)]
+        game._draw_effects(lambda x: x, lambda y: y, 100, 100)
+        self.assertEqual(game.canvas.create_oval.call_count, 2)
+
     def test_grid_preserves_all_pairs_separation_and_random_order(self):
         for seed in range(40):
             rng = random.Random(seed)
